@@ -9,7 +9,7 @@ import metrics
 import plan_boundary as pb
 import record_result as rr
 
-REPORT_VERSION = "0.2.0"
+REPORT_VERSION = "0.3.0"
 _STAGE_LABEL = {
     "client-validation": "Client validation (rejected before send)",
     "upload": "Upload",
@@ -58,28 +58,75 @@ def _boundaries(ledger: dict) -> dict:
     }
 
 
-def reconcile(documented: float | None, b: dict, unit: str) -> tuple[str, str]:
-    usable, first_fail = b["usable"], b["firstFail"]
+def reconcile(documented: float | None, b: dict, unit: str,
+              *, tolerance: float | None = None, min_trials: int = 2) -> tuple[str, str]:
+    """Classify measurement against published guidance.
+
+    Every verdict must be earned by evidence that was actually collected. In
+    particular, a value is never called permissive or restrictive unless a
+    value on the relevant side of the documented boundary was really tested.
+    """
+    usable, first_fail, values = b["usable"], b["firstFail"], b["values"]
+    fmt = lambda v: metrics.format_metric(v, unit)
+
     if documented is None:
         return (
             "no-published-limit",
             "No authoritative published limit was recorded for this path. The result below is a scoped measurement, not a supported product limit.",
         )
-    if usable is None:
-        return ("inconclusive", "No tested value passed the defined end-to-end success criterion, so the published limit could not be reconciled.")
-    if first_fail is not None and usable <= documented < first_fail:
+    if usable is None and first_fail is None:
+        return ("inconclusive", "No numeric observation was recorded, so the published limit could not be reconciled.")
+    if usable is not None and first_fail is not None and usable > first_fail:
         return (
-            "match",
-            f"Measured behaviour is consistent with the documented boundary of {metrics.format_metric(documented, unit)} within the tested interval.",
+            "inconclusive",
+            f"{fmt(usable)} passed while the smaller value {fmt(first_fail)} failed. The metric is not behaving monotonically, so no boundary can be reconciled until the confounder is found.",
         )
-    if usable < documented:
+    if usable is None:
+        return (
+            "inconclusive",
+            f"No tested value met the end-to-end success criterion, including values at or below the documented {fmt(documented)}. Establish a working baseline before treating this as a boundary.",
+        )
+
+    if first_fail is not None and first_fail <= documented:
         return (
             "more-restrictive-than-documented",
-            f"The largest consistently usable value observed was {metrics.format_metric(usable, unit)}, below the documented {metrics.format_metric(documented, unit)}. Treat this as an environment-scoped discrepancy and investigate before relying on the documented value here.",
+            f"{fmt(first_fail)} failed consistently, at or below the documented {fmt(documented)}. The largest value that met the criterion was {fmt(usable)}. Treat this as an environment-scoped discrepancy and investigate before relying on the documented value here.",
+        )
+    if usable > documented:
+        return (
+            "observed-headroom",
+            f"{fmt(usable)} met the criterion, above the documented {fmt(documented)}. This is unsupported headroom observed in one environment, not a supported product capability; design to the documented boundary.",
+        )
+
+    # Remaining case: every passing value is at or below the documented
+    # boundary, and every failing value is above it.
+    tolerance = metrics.default_tolerance(unit) if tolerance is None else float(tolerance)
+    at_documented = values.get(float(documented))
+    documented_passes = bool(at_documented) and at_documented["verdict"] == "pass"
+    repeated = documented_passes and at_documented["trials"] >= min_trials
+    fail_repeated = first_fail is not None and values[first_fail]["trials"] >= min_trials
+
+    if repeated and fail_repeated and (first_fail - documented) <= tolerance:
+        return (
+            "confirmed-match",
+            f"The documented boundary of {fmt(documented)} was tested directly and passed on {at_documented['trials']} trials, while {fmt(first_fail)} failed. Measurement and guidance agree at this boundary, in this environment.",
+        )
+    if first_fail is not None:
+        detail = (
+            f"{fmt(documented)} itself passed, but the nearest failing value {fmt(first_fail)} is more than {fmt(tolerance)} above it, so the exact boundary is not resolved."
+            if documented_passes else
+            f"{fmt(documented)} itself was never tested; the boundary lies somewhere between {fmt(usable)} (pass) and {fmt(first_fail)} (fail)."
+        )
+        return ("consistent-with-guidance", f"Nothing contradicts the documented {fmt(documented)}. {detail}")
+
+    if documented_passes:
+        return (
+            "inconclusive",
+            f"The documented {fmt(documented)} was tested and passed, but no larger value was tested. This does not establish whether the boundary sits at the documented value or above it.",
         )
     return (
-        "more-permissive-than-documented",
-        f"Values above the documented {metrics.format_metric(documented, unit)} boundary worked in this test, up to {metrics.format_metric(usable, unit)}. This is unsupported headroom, not a supported product capability; design to the documented boundary.",
+        "inconclusive",
+        f"The largest passing value was {fmt(usable)}, at or below the documented {fmt(documented)}, and no value failed. Nothing above the documented boundary was tested, so guidance can be neither confirmed nor contradicted.",
     )
 
 
@@ -88,7 +135,52 @@ def _stage(value: str) -> str:
 
 
 def _evidence(ledger: dict) -> str:
-    return "Official guidance + Measured" if ledger.get("documentedLimit") else "Measured"
+    """A documented value only counts as official guidance when it is
+    attributable: a value, a source, and the date the source was read."""
+    documented = ledger.get("documentedLimit") or {}
+    if not documented:
+        return "Measured"
+    if documented.get("value") is not None and documented.get("source") and documented.get("checkedAt"):
+        return "Official guidance + Measured"
+    return "Documented value supplied + Measured"
+
+
+_SCOPE_LABEL = {
+    "platform": "Platform", "harness": "Harness", "environmentType": "Environment",
+    "region": "Region", "channel": "Channel", "model": "Model",
+    "licenseContext": "Licence", "testedAt": "Tested", "notes": "Notes",
+}
+
+
+def _scope_line(ledger: dict) -> list[str]:
+    scope = ledger.get("scope") or {}
+    recorded = [(k, scope[k]) for k in rr.SCOPE_KEYS if scope.get(k)]
+    if not recorded:
+        return [
+            "**Scope:** not recorded  ",
+            "",
+            "> **Scope was not recorded.** A boundary is only meaningful against the tenant, region, licence, harness and date it was measured in. Without them this result cannot be compared with a later run or another environment.",
+            "",
+        ]
+    return [f"**Scope:** {'; '.join(f'{_SCOPE_LABEL[k]} {v}' for k, v in recorded)}  "]
+
+
+def _path_integrity_block(ledger: dict) -> list[str]:
+    state = ledger.get("pathIntegrity", "not-attested")
+    if state == "attested":
+        return [
+            "> **Path integrity attested.** The operator confirmed the agent had no alternate route to the artefact contents, so a correct canary is evidence about the tested path.",
+            "",
+        ]
+    if state == "bypass-observed":
+        return [
+            "> **Path integrity failed — coverage evidence is void.** An alternate access route to the artefact was available or used, so a correct canary shows only that the agent obtained the content somehow. It is not evidence about the tested path. Re-run with that route disabled.",
+            "",
+        ]
+    return [
+        "> **Path integrity not attested.** A correct canary proves the agent obtained the content by *some* route available to it, which is only evidence about this path if no alternate route (runtime file reads, unzipping, PDF libraries, filesystem search) existed. Read coverage results accordingly.",
+        "",
+    ]
 
 
 def render_ledger(ledger: dict) -> str:
@@ -107,7 +199,9 @@ def render_ledger(ledger: dict) -> str:
         source = (ledger.get("documentedLimit") or {}).get("source")
         src = f" ([source]({source}))" if source else ""
         lines.append(f"**Documented limit:** {metrics.format_metric(documented, unit)}{src}  ")
+    lines.extend(_scope_line(ledger))
     lines.extend([
+        f"**Path integrity:** `{ledger.get('pathIntegrity', 'not-attested')}`  ",
         f"**Largest verified usable value:** {metrics.format_metric(b['usable'], unit)}  ",
         f"**First consistent failing value:** {metrics.format_metric(b['firstFail'], unit)}  ",
         f"**Largest explicitly accepted value:** {metrics.format_metric(b['acceptance'], unit)}  ",
@@ -116,6 +210,7 @@ def render_ledger(ledger: dict) -> str:
         f"**Reconciliation:** `{verdict}`", "",
         "### Result", "", prose, "",
     ])
+    lines.extend(_path_integrity_block(ledger))
     if planning["status"] != "converged":
         lines.extend([f"> **Boundary status: `{planning['status']}`.** {planning['recommendation']}", ""])
     if b["acceptance"] is not None and b["usable"] is not None and b["acceptance"] > b["usable"]:
@@ -190,6 +285,7 @@ def build_report(ledgers: list[dict]) -> str:
         "# Verified Limits Report", "",
         f"Generated {stamp} by `copilot-studio-limits-validator` v{REPORT_VERSION}.", "",
         "Every measured value is scoped to the environment and conditions in which it was observed. Product updates, tenant configuration, region, licence, harness, ingestion path, and downstream dependencies can change the result. Re-measure before generalising it.", "",
+        "A verdict here describes only what was actually tested. `confirmed-match` requires the documented value to have been tested directly and repeated; `consistent-with-guidance` means nothing contradicted it; `inconclusive` means the evidence does not settle the question either way.", "",
     ]
     body = [render_ledger(l) for l in ledgers]
     if len(ledgers) > 1:

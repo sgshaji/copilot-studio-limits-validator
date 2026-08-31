@@ -4,10 +4,13 @@
 Modes:
   size     vary bytes while holding page count constant
   pages    vary page count while holding file size constant
-  formats  compare formats at one fixed byte size/page count
-  count    create separate attachment-count scenarios (one turn per scenario)
+  count    create separate attachment-count scenarios (one conversation each)
 
-The manifest contains secret canaries. The probe sheet never does.
+Format is a dimension to hold constant, not a metric to sweep: to compare
+formats, run the same sweep once per --format and compare the ledgers.
+
+Artefacts are written to <out-dir>/upload/ so the upload set is unambiguous.
+The manifest stores canary digests, never tokens.
 """
 from __future__ import annotations
 
@@ -21,8 +24,9 @@ import make_test_file as mtf
 import metrics
 
 BUILDER_ID = "limits-validator-test-pack"
-BUILDER_VERSION = "0.2.0"
-MODES = ("size", "pages", "formats", "count")
+BUILDER_VERSION = "0.3.0"
+UPLOAD_DIR = "upload"
+MODES = ("size", "pages", "count")
 
 
 def sweep_around(centre: int) -> list[int]:
@@ -54,6 +58,8 @@ def build(mode: str, out_dir: str, fmt: str = "pdf",
           pages: int = 10, fixed_size: int = 0,
           counts: list[int] | None = None, run_id: str | None = None) -> dict:
     os.makedirs(out_dir, exist_ok=True)
+    upload_dir = os.path.join(out_dir, UPLOAD_DIR)
+    os.makedirs(upload_dir, exist_ok=True)
     pack_id = run_id or mtf.new_run_id()
     artefacts: list[dict] = []
     scenarios: list[dict] = []
@@ -61,7 +67,7 @@ def build(mode: str, out_dir: str, fmt: str = "pdf",
 
     def emit(name: str, f_fmt: str, target: int, n_pages: int,
              metric: dict, scenario: str | None = None) -> dict | None:
-        path = os.path.join(out_dir, name)
+        path = os.path.join(upload_dir, name)
         entry = mtf.run(f_fmt, target, n_pages, _artifact_run_id(pack_id, name), path)
         if not entry["exactSize"]:
             if os.path.exists(path):
@@ -98,14 +104,6 @@ def build(mode: str, out_dir: str, fmt: str = "pdf",
         for n in requested:
             emit(f"{fmt}-{n:05d}pages.{fmt}", fmt, target, n,
                  {"name": metric_name, "value": n, "unit": metric_unit})
-
-    elif mode == "formats":
-        metric_name, metric_unit = "format", "category"
-        if not fixed_size:
-            raise ValueError("formats mode requires --size")
-        for f_fmt in mtf.FORMATS:
-            emit(f"{f_fmt}-{_label_bytes(fixed_size)}.{f_fmt}", f_fmt, fixed_size, pages,
-                 {"name": metric_name, "value": f_fmt, "unit": metric_unit})
 
     elif mode == "count":
         metric_name, metric_unit = "attachment-count", "attachments"
@@ -152,12 +150,13 @@ def write_probe_sheet(manifest: dict, out_dir: str) -> str:
     lines = [
         f"# Probe sheet — pack {manifest['packId']}", "",
         "This sheet contains probe positions but **not** expected tokens.",
-        "Do not inspect `manifest.json` until after the model has returned its claims.", "",
+        "The manifest stores only SHA-256 digests, so it holds no recoverable answer; keeping it aside until claims are captured is defence in depth, not the load-bearing control.", "",
+        "**Path integrity:** ask for the tokens only through the path under test. Do not open, parse, unzip, or grep the artefact with runtime code unless that runtime access *is* the path being measured.", "",
     ]
     if manifest["mode"] == "count":
         lines.append("## Attachment-count scenarios")
         lines.append("")
-        lines.append("Upload each scenario in a **separate conversation turn**. Mixing scenarios invalidates the count measurement.")
+        lines.append("Test each scenario in its own **fresh conversation**. Attachments from an earlier turn can remain in context and inflate the count actually in play.")
         lines.append("")
         by_file = {a["file"]: a for a in manifest["artefacts"]}
         for s in manifest["scenarios"]:
@@ -170,11 +169,11 @@ def write_probe_sheet(manifest: dict, out_dir: str) -> str:
         for a in manifest["artefacts"]:
             pages = ", ".join(str(c["page"]) for c in a["canaries"])
             metric = a["metric"]
-            value = metrics.format_metric(metric["value"], metric["unit"]) if metric["unit"] != "category" else str(metric["value"])
+            value = metrics.format_metric(metric["value"], metric["unit"])
             lines.append(f"- `{a['file']}` — test value: {value}; probe positions: {pages}")
     lines.extend([
         "", "### Evidence rule", "",
-        "A correct token proves that content at that position was available end-to-end to the agent for this probe. ",
+        "A correct token proves the agent obtained content at that position by **some** route available to it during this probe. It proves the tested path specifically only if no alternate access route (runtime file reads, unzipping, PDF libraries, filesystem search) was available or used.", "",
         "A missing token proves only that end-to-end availability was **not demonstrated**; it does not, by itself, identify parsing, indexing, retrieval, or context handling as the failing stage.",
     ])
     path = os.path.join(out_dir, "probe-sheet.md")
@@ -188,18 +187,23 @@ def write_upload_instructions(manifest: dict, out_dir: str) -> str:
         f"# Upload instructions — pack {manifest['packId']}", "",
         f"Generated artefacts: **{manifest['artefactCount']}**  ",
         f"Total generated bytes: **{metrics.human_bytes(manifest['totalBytes'])}**", "",
-        "Synthetic content only. Do not rename, re-save, convert, or compress the files.", "",
+        f"Artefacts are in `{UPLOAD_DIR}/`. Synthetic content only. Do not rename, re-save, convert, or compress the files.", "",
+        "## Path integrity", "",
+        "Retrieve canary tokens only through the path under test. If the agent can read the artefact with runtime code (Python, unzip, PDF libraries, filesystem search), a correct token no longer proves the tested path carried the content. Either disable that route or record the run as not path-attested.", "",
     ]
     if manifest["mode"] == "count":
         lines.extend([
             "## Important: count tests are separate scenarios", "",
-            "Each attachment count must be tested in its own conversation turn. Upload only the files belonging to one scenario, record whether the client accepted all of them, then move to the next scenario.", "",
+            "Test each attachment count in its own **fresh conversation**, not merely a new turn: files attached earlier can stay in context and change the count actually under test. Upload only the files belonging to one scenario, record whether the client accepted all of them, then start a new conversation for the next scenario.", "",
         ])
         for s in manifest["scenarios"]:
             lines.append(f"- `{s['id']}`: {len(s['files'])} files, {metrics.human_bytes(s['totalBytes'])}")
     else:
         lines.extend([
-            "Upload the artefacts in as few turns as the channel permits. Record any file rejected by the client before send; the agent cannot observe a file it never received.", "",
+            "## Upload one artefact per turn", "",
+            "Attach exactly one artefact per conversation turn, and use a fresh conversation for the values that decide the boundary.", "",
+            "Uploading the sweep together changes three variables at once — per-file size, attachment count, and total turn payload — so a failure could not be attributed to any of them. Batch generation is the labour saving; batch uploading destroys the measurement.", "",
+            "Record any file the client rejects before send: the agent cannot observe a file it never received.", "",
         ])
     lines.extend([
         "", "After upload, use `probe-sheet.md` to request exact canary values. Keep `manifest.json` hidden from the model until claims have been captured and are ready for verification.",
@@ -214,11 +218,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--mode", choices=MODES, default="size")
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--format", choices=mtf.FORMATS, default="pdf")
+    ap.add_argument("--format", choices=mtf.FORMATS, default="pdf",
+                    help="format to hold constant; to compare formats run this sweep once per format and compare ledgers")
     ap.add_argument("--sweep", help="comma-separated sizes, page counts, or attachment counts")
     ap.add_argument("--around", help="suspected byte-size limit for mode=size")
-    ap.add_argument("--size", help="fixed artefact size for pages/formats/count")
-    ap.add_argument("--pages", type=int, default=10, help="fixed page/slide/row count for size/formats")
+    ap.add_argument("--size", help="fixed artefact size for pages/count modes")
+    ap.add_argument("--pages", type=int, default=10, help="fixed page/slide/row count for size mode")
     ap.add_argument("--count", type=int, help="single attachment-count scenario; --sweep is preferred")
     ap.add_argument("--run-id")
     args = ap.parse_args(argv)
@@ -237,8 +242,6 @@ def main(argv: list[str] | None = None) -> int:
         if not args.sweep:
             ap.error("pages mode requires --sweep, e.g. 10,50,100,250")
         pages_list = [int(v) for v in args.sweep.split(",") if v.strip()]
-    elif args.mode == "formats" and not args.size:
-        ap.error("formats mode requires --size")
     elif args.mode == "count":
         if args.sweep:
             counts = [int(v) for v in args.sweep.split(",") if v.strip()]
@@ -258,7 +261,8 @@ def main(argv: list[str] | None = None) -> int:
     write_probe_sheet(manifest, args.out_dir)
 
     print(f"pack {manifest['packId']}  mode={manifest['mode']}  artefacts={manifest['artefactCount']}  total={metrics.human_bytes(manifest['totalBytes'])}")
-    print(f"next: read {out_dir if (out_dir := args.out_dir) else args.out_dir}/UPLOAD-ME.md")
+    print(f"artefacts: {os.path.join(args.out_dir, UPLOAD_DIR)}")
+    print(f"next: read {os.path.join(args.out_dir, 'UPLOAD-ME.md')}")
     return 0
 
 

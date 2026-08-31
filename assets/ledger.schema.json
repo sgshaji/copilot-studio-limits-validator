@@ -2,121 +2,363 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://microsoft.github.io/cat-agent-skills/schemas/limits-validator-ledger.json",
   "title": "Copilot Studio Limits Validator observation ledger",
-  "description": "Scoped, stage-by-stage observations for one capability, one path, and one numeric boundary metric.",
+  "description": "Scoped, stage-by-stage observations for one capability, one path, and one numeric boundary metric, together with the environment scope and path-integrity attestation the observations are only valid under.",
   "type": "object",
-  "required": ["ledgerVersion", "capability", "path", "metric", "observations"],
+  "required": [
+    "ledgerVersion",
+    "capability",
+    "path",
+    "metric",
+    "scope",
+    "pathIntegrity",
+    "observations"
+  ],
   "additionalProperties": false,
   "properties": {
-    "ledgerVersion": { "type": "string", "examples": ["0.2.0"] },
-    "capability": { "type": "string" },
+    "ledgerVersion": {
+      "type": "string",
+      "examples": [
+        "0.3.0"
+      ]
+    },
+    "capability": {
+      "type": "string"
+    },
     "path": {
       "type": "string",
       "enum": [
-        "direct-upload", "agent-knowledge", "sharepoint", "sharepoint-library",
-        "onedrive", "tool-input", "tool-output", "generated-output", "runtime"
+        "direct-upload",
+        "agent-knowledge",
+        "sharepoint",
+        "sharepoint-library",
+        "onedrive",
+        "tool-input",
+        "tool-output",
+        "generated-output",
+        "runtime"
       ]
     },
-    "metric": { "$ref": "#/$defs/metricDescriptor" },
-    "packId": { "type": "string" },
+    "metric": {
+      "$ref": "#/$defs/metricDescriptor"
+    },
+    "packId": {
+      "type": "string"
+    },
     "documentedLimit": {
       "oneOf": [
-        { "type": "null" },
+        {
+          "type": "null"
+        },
         {
           "type": "object",
-          "required": ["unit"],
+          "required": [
+            "unit"
+          ],
           "additionalProperties": false,
           "properties": {
-            "value": { "type": ["number", "null"], "minimum": 0 },
-            "unit": { "type": "string" },
-            "text": { "type": "string" },
-            "source": { "type": "string" }
+            "value": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "unit": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            },
+            "checkedAt": {
+              "type": "string",
+              "description": "Date the official source was read. Required before evidence may be labelled 'Official guidance + Measured'."
+            }
           }
         }
       ]
     },
-    "createdAt": { "type": "string" },
+    "createdAt": {
+      "type": "string"
+    },
     "observations": {
       "type": "array",
-      "items": { "$ref": "#/$defs/observation" }
+      "items": {
+        "$ref": "#/$defs/observation"
+      }
+    },
+    "scope": {
+      "type": "object",
+      "description": "What the measurement is scoped to. Never record tenant identifiers, user identities, or secrets.",
+      "additionalProperties": false,
+      "properties": {
+        "platform": {
+          "type": "string"
+        },
+        "harness": {
+          "type": "string"
+        },
+        "environmentType": {
+          "type": "string"
+        },
+        "region": {
+          "type": "string"
+        },
+        "channel": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "licenseContext": {
+          "type": "string"
+        },
+        "testedAt": {
+          "type": "string"
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "pathIntegrity": {
+      "type": "string",
+      "enum": [
+        "attested",
+        "not-attested",
+        "bypass-observed"
+      ],
+      "description": "Whether the operator confirmed the canary could not have reached the agent by a route other than the tested path. Human attestation; not verifiable by code."
     }
   },
   "$defs": {
     "metricDescriptor": {
       "type": "object",
-      "required": ["name", "unit"],
+      "required": [
+        "name",
+        "unit"
+      ],
       "additionalProperties": false,
       "properties": {
-        "name": { "type": "string", "examples": ["file-size", "page-count", "attachment-count", "tool-response-size", "execution-duration"] },
-        "unit": { "type": "string", "examples": ["bytes", "pages", "attachments", "milliseconds", "records"] }
+        "name": {
+          "type": "string",
+          "examples": [
+            "file-size",
+            "page-count",
+            "attachment-count",
+            "tool-response-size",
+            "execution-duration"
+          ]
+        },
+        "unit": {
+          "type": "string",
+          "examples": [
+            "bytes",
+            "pages",
+            "attachments",
+            "milliseconds",
+            "records"
+          ]
+        }
       }
     },
     "metricObservation": {
       "type": "object",
-      "required": ["name", "value", "unit"],
+      "required": [
+        "name",
+        "value",
+        "unit"
+      ],
       "additionalProperties": false,
       "properties": {
-        "name": { "type": "string" },
-        "value": { "type": ["number", "string"] },
-        "unit": { "type": "string" }
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "number",
+          "description": "Numeric value of the swept metric. Categorical properties (e.g. format) are held constant, not swept."
+        },
+        "unit": {
+          "type": "string"
+        }
       }
     },
     "stageValue": {
       "type": "string",
-      "enum": ["pass", "fail", "partial", "unknown", "not-tested"]
+      "enum": [
+        "pass",
+        "fail",
+        "partial",
+        "unknown",
+        "not-tested"
+      ]
     },
     "canaryObservation": {
       "type": "object",
-      "required": ["position", "found"],
+      "required": [
+        "position",
+        "found"
+      ],
       "additionalProperties": true,
       "properties": {
-        "file": { "type": ["string", "null"] },
-        "position": { "type": "integer", "minimum": 1 },
-        "expected": { "type": ["string", "null"] },
-        "claimed": { "type": ["string", "null"] },
-        "found": { "type": "boolean" },
-        "mismatch": { "type": "boolean" }
-      }
+        "file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "position": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "claimed": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "found": {
+          "type": "boolean"
+        },
+        "mismatch": {
+          "type": "boolean"
+        },
+        "expectedSha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "SHA-256 of the expected token. The token itself exists only inside the artefact."
+        }
+      },
+      "description": "One probe position. Verification compares the digest of the claimed token with expectedSha256."
     },
     "observation": {
       "type": "object",
-      "required": ["subject", "metric", "trial", "stages", "canaries", "outcome", "failureStage", "recordedAt"],
+      "required": [
+        "subject",
+        "metric",
+        "trial",
+        "stages",
+        "canaries",
+        "outcome",
+        "failureStage",
+        "recordedAt"
+      ],
       "additionalProperties": false,
       "properties": {
-        "subject": { "type": "string" },
-        "format": { "type": ["string", "null"] },
-        "bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "pages": { "type": ["integer", "null"], "minimum": 0 },
-        "metric": { "$ref": "#/$defs/metricObservation" },
-        "trial": { "type": "integer", "minimum": 1 },
+        "subject": {
+          "type": "string"
+        },
+        "format": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "pages": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "metric": {
+          "$ref": "#/$defs/metricObservation"
+        },
+        "trial": {
+          "type": "integer",
+          "minimum": 1
+        },
         "stages": {
           "type": "object",
-          "required": ["accepted", "transferred", "processed", "retrievable", "coverage"],
+          "required": [
+            "accepted",
+            "transferred",
+            "processed",
+            "retrievable",
+            "coverage"
+          ],
           "additionalProperties": false,
           "properties": {
-            "accepted": { "$ref": "#/$defs/stageValue" },
-            "transferred": { "$ref": "#/$defs/stageValue" },
-            "processed": { "$ref": "#/$defs/stageValue" },
-            "retrievable": { "$ref": "#/$defs/stageValue" },
-            "coverage": { "$ref": "#/$defs/stageValue" }
+            "accepted": {
+              "$ref": "#/$defs/stageValue"
+            },
+            "transferred": {
+              "$ref": "#/$defs/stageValue"
+            },
+            "processed": {
+              "$ref": "#/$defs/stageValue"
+            },
+            "retrievable": {
+              "$ref": "#/$defs/stageValue"
+            },
+            "coverage": {
+              "$ref": "#/$defs/stageValue"
+            }
           }
         },
         "canaries": {
           "type": "array",
-          "items": { "$ref": "#/$defs/canaryObservation" }
+          "items": {
+            "$ref": "#/$defs/canaryObservation"
+          }
         },
-        "outcome": { "type": "string", "enum": ["pass", "fail", "partial", "inconclusive"] },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "partial",
+            "inconclusive"
+          ]
+        },
         "failureStage": {
           "type": "string",
           "enum": [
-            "client-validation", "upload", "transport", "ingestion", "connector",
-            "sharepoint-retrieval", "onedrive-retrieval", "parsing", "indexing",
-            "runtime-transfer", "context-handling", "tool-invocation", "downstream-api",
-            "generated-output", "coverage", "none", "unknown"
+            "client-validation",
+            "upload",
+            "transport",
+            "ingestion",
+            "connector",
+            "sharepoint-retrieval",
+            "onedrive-retrieval",
+            "parsing",
+            "indexing",
+            "runtime-transfer",
+            "context-handling",
+            "tool-invocation",
+            "downstream-api",
+            "generated-output",
+            "coverage",
+            "none",
+            "unknown"
           ]
         },
-        "error": { "type": ["string", "null"] },
-        "note": { "type": ["string", "null"] },
-        "recordedAt": { "type": "string" }
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recordedAt": {
+          "type": "string"
+        }
       }
     }
   }

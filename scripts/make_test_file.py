@@ -2,9 +2,10 @@
 """Generate exact-size synthetic test artefacts with non-derivable canaries.
 
 Supports PDF, DOCX, XLSX, PPTX and TXT using only the Python standard library.
-Each probed position receives an independently random canary token. The token is
-stored only in the returned manifest and embedded in the artefact; it is not
-derivable from the visible run id, file name, page number, or bundled code.
+Each probed position receives an independently random 96-bit canary token. The
+token is embedded in the artefact and nowhere else: the manifest stores only its
+SHA-256 digest. Verification hashes what the model claimed and compares digests,
+so reading the manifest cannot reveal an answer.
 """
 from __future__ import annotations
 
@@ -45,6 +46,12 @@ def new_canaries(pages: int) -> dict[int, str]:
         page: f"CANARY-P{page:04d}-{secrets.token_hex(12).upper()}"
         for page in canary_pages(pages)
     }
+
+
+def canary_digest(token: str) -> str:
+    """Digest used for verification. Tokens carry 96 bits of entropy, so the
+    digest is not invertible by search: publishing it reveals nothing."""
+    return hashlib.sha256(str(token).strip().upper().encode()).hexdigest()
 
 
 def _filler(page: int, run_id: str, width: int = 88) -> str:
@@ -333,7 +340,8 @@ def run(fmt: str, target_bytes: int, pages: int = 10, run_id: str | None = None,
         "exactSize": exact,
         "paddingBytes": pad,
         "minimumBytes": None if exact else len(builder(pages, rid, canaries, 0)),
-        "canaries": [{"page": p, "token": canaries[p]} for p in sorted(canaries)],
+        # Digest only. The token itself exists solely inside the artefact.
+        "canaries": [{"page": p, "tokenSha256": canary_digest(canaries[p])} for p in sorted(canaries)],
         "generator": {"id": GENERATOR_ID, "version": GENERATOR_VERSION},
         "generatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }

@@ -42,3 +42,7 @@ If there is no documented or suspected upper bound, obtain an explicit safe cap 
 ## Evidence discipline
 
 A test that was not run is `not-tested`/`unknown`, not `unsupported`. A canary miss identifies an end-to-end coverage failure, not an internal root cause unless direct evidence identifies that stage.
+
+Never obtain a canary through a route other than the path under test. Reading the artefact with runtime code, unzipping it, or searching the filesystem produces a correct token that proves nothing about ingestion, parsing, indexing, or retrieval. If such a route was available, record `--path-integrity not-attested`; if one was used, record `bypass-observed` and do not publish the coverage result as evidence about that path.
+
+Record the scope a measurement is valid under rather than asserting it in prose, and never record tenant identifiers, user identities, secrets, or connection details while doing so.

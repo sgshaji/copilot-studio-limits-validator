@@ -26,6 +26,8 @@ A documented limit must include:
 - exact source;
 - date checked.
 
+Record the date with `--documented-checked-at`. Guidance changes, and a documented value with no read date is not attributable: evidence is only labelled `Official guidance + Measured` when a value, a source, and a check date are all present.
+
 Examples of distinct metrics include file bytes, attachment count, pages, records, payload bytes, and execution duration. Do not collapse them into a generic “limit”.
 
 ## Unit traps
@@ -34,4 +36,6 @@ Microsoft pages may use MB without explicitly distinguishing decimal MB (1,000,0
 
 ## Supported vs observed
 
-A value above a documented limit may sometimes work. That is unsupported headroom, not a supported capability. Report it as `more-permissive-than-documented` and keep the published limit as the design boundary unless Microsoft changes its guidance.
+A value above a documented limit may sometimes work. That is unsupported headroom, not a supported capability. Report it as `observed-headroom` and keep the published limit as the design boundary unless Microsoft changes its guidance.
+
+The reverse claim needs evidence too. Do not report a discrepancy in either direction unless a value on the relevant side of the documented boundary was actually tested: a documented value that merely sits between a pass and a fail has not been validated.

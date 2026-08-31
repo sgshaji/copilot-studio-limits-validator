@@ -41,7 +41,14 @@ def parse_metric(text: str, unit: str) -> float:
     if unit == "bytes":
         return float(parse_bytes(text))
     raw = str(text).strip().replace(",", "")
-    value = float(raw)
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(
+            f"{raw!r} is not a numeric {unit or 'metric'} value. This skill validates "
+            "quantitative boundaries; categorical properties such as file format are "
+            "dimensions to hold constant, not metrics to sweep."
+        ) from None
     if value < 0:
         raise ValueError("metric value must be non-negative")
     return value
@@ -62,6 +69,10 @@ def format_metric(value: int | float | None, unit: str) -> str:
     if value is None:
         return "not established"
     unit = (unit or "units").strip().lower()
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        # Never crash the ledger/report pipeline on an unexpected non-numeric
+        # value; render it literally and let the caller judge it.
+        return str(value)
     if unit == "bytes":
         return human_bytes(value)
     if unit in DISCRETE_UNITS or float(value).is_integer():
