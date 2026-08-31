@@ -208,6 +208,8 @@ copilot-studio-limits-validator/
 │   └── report-template.md
 ├── tests/
 │   └── test_core.py
+├── build_package.py
+├── dist/
 └── .github/workflows/test.yml
 ```
 
@@ -220,5 +222,17 @@ python -m unittest discover -s tests -v
 35 tests, no third-party Python packages. They cover canary independence and digest verification, exact-size generation, structural validity of all five formats, pack isolation, planner convergence, every reconciliation verdict, evidence gating, scope and path-integrity recording, schema conformance, and a build → record → plan → report round trip.
 
 ## Packaging
+
+Build the uploadable skill package:
+
+```bash
+python build_package.py
+```
+
+This writes `dist/copilot-studio-limits-validator-skill-v<version>.zip` with `SKILL.md` at the **ZIP root** alongside `references/`, `scripts/` and `assets/`. The version comes from `metadata.json`, and the build refuses to produce a package whose front matter is malformed or which is missing a file `SKILL.md` references. `tests/`, `.github/` and `metadata.json` are excluded — the first two are development-only, and the third is the CAT submission manifest rather than part of the skill format.
+
+Import it in Copilot Studio: **agent → Build → Skills → Add skill → Upload a skill**. Skills require an agent on the GitHub Copilot harness; the Skills panel does not appear otherwise.
+
+Re-run the build after changing any skill file — the committed zip is a snapshot, not a live view.
 
 The CAT submission folder should contain only the canonical skill material and its human-facing sidecars — `metadata.json`, `README.md`, `SKILL.md`, `scripts/`, `references/`, `assets/`. Keep `tests/` and `.github/` in the development repository; anything else in the submission is bundled into the agent unnecessarily.
