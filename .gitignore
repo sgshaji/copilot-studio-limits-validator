@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Test artifacts produced by the scripts
+runs/
+out/
+*.tmp
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
