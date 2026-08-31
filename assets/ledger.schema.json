@@ -2,35 +2,37 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://microsoft.github.io/cat-agent-skills/schemas/limits-validator-ledger.json",
   "title": "Copilot Studio Limits Validator observation ledger",
-  "description": "Stage-by-stage observations for one capability on one ingestion path. Written by record_result.py; read by plan_boundary.py and generate_report.py.",
+  "description": "Scoped, stage-by-stage observations for one capability, one path, and one numeric boundary metric.",
   "type": "object",
-  "required": ["ledgerVersion", "capability", "path", "observations"],
+  "required": ["ledgerVersion", "capability", "path", "metric", "observations"],
   "additionalProperties": false,
   "properties": {
-    "ledgerVersion": { "type": "string", "examples": ["0.1.0"] },
-    "capability": {
-      "type": "string",
-      "description": "Human-readable capability under test.",
-      "examples": ["Direct file upload - PDF"]
-    },
+    "ledgerVersion": { "type": "string", "examples": ["0.2.0"] },
+    "capability": { "type": "string" },
     "path": {
       "type": "string",
-      "description": "Ingestion path. Results are never portable between paths.",
       "enum": [
         "direct-upload", "agent-knowledge", "sharepoint", "sharepoint-library",
         "onedrive", "tool-input", "tool-output", "generated-output", "runtime"
       ]
     },
-    "packId": { "type": "string", "description": "Test pack this ledger draws from." },
+    "metric": { "$ref": "#/$defs/metricDescriptor" },
+    "packId": { "type": "string" },
     "documentedLimit": {
-      "type": ["object", "null"],
-      "description": "Published guidance, recorded BEFORE testing. Null means no authoritative limit was found, which is itself a reportable result.",
-      "additionalProperties": false,
-      "properties": {
-        "bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "text": { "type": "string" },
-        "source": { "type": "string", "description": "URL of the authoritative page." }
-      }
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["unit"],
+          "additionalProperties": false,
+          "properties": {
+            "value": { "type": ["number", "null"], "minimum": 0 },
+            "unit": { "type": "string" },
+            "text": { "type": "string" },
+            "source": { "type": "string" }
+          }
+        }
+      ]
     },
     "createdAt": { "type": "string" },
     "observations": {
@@ -39,22 +41,53 @@
     }
   },
   "$defs": {
+    "metricDescriptor": {
+      "type": "object",
+      "required": ["name", "unit"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "examples": ["file-size", "page-count", "attachment-count", "tool-response-size", "execution-duration"] },
+        "unit": { "type": "string", "examples": ["bytes", "pages", "attachments", "milliseconds", "records"] }
+      }
+    },
+    "metricObservation": {
+      "type": "object",
+      "required": ["name", "value", "unit"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "value": { "type": ["number", "string"] },
+        "unit": { "type": "string" }
+      }
+    },
     "stageValue": {
       "type": "string",
-      "enum": ["pass", "fail", "partial", "unknown", "not-tested"],
-      "description": "'unknown' means not observed. A stage is never 'fail' merely because it was not checked."
+      "enum": ["pass", "fail", "partial", "unknown", "not-tested"]
+    },
+    "canaryObservation": {
+      "type": "object",
+      "required": ["position", "found"],
+      "additionalProperties": true,
+      "properties": {
+        "file": { "type": ["string", "null"] },
+        "position": { "type": "integer", "minimum": 1 },
+        "expected": { "type": ["string", "null"] },
+        "claimed": { "type": ["string", "null"] },
+        "found": { "type": "boolean" },
+        "mismatch": { "type": "boolean" }
+      }
     },
     "observation": {
       "type": "object",
-      "required": ["file", "trial", "stages", "outcome", "failureStage"],
+      "required": ["subject", "metric", "trial", "stages", "canaries", "outcome", "failureStage", "recordedAt"],
       "additionalProperties": false,
       "properties": {
-        "file": { "type": "string" },
-        "format": { "type": ["string", "null"], "enum": ["pdf", "docx", "xlsx", "pptx", "txt", null] },
+        "subject": { "type": "string" },
+        "format": { "type": ["string", "null"] },
         "bytes": { "type": ["integer", "null"], "minimum": 0 },
         "pages": { "type": ["integer", "null"], "minimum": 0 },
-        "runId": { "type": ["string", "null"], "description": "Per-artefact run id; canary tokens derive from it." },
-        "trial": { "type": "integer", "minimum": 1, "description": "Nth attempt at this artefact. Boundaries need >1." },
+        "metric": { "$ref": "#/$defs/metricObservation" },
+        "trial": { "type": "integer", "minimum": 1 },
         "stages": {
           "type": "object",
           "required": ["accepted", "transferred", "processed", "retrievable", "coverage"],
@@ -69,33 +102,16 @@
         },
         "canaries": {
           "type": "array",
-          "description": "Per-position verification. 'found' is true only when the reported token matched the manifest verbatim.",
-          "items": {
-            "type": "object",
-            "required": ["page", "token", "found"],
-            "additionalProperties": false,
-            "properties": {
-              "page": { "type": "integer", "minimum": 1 },
-              "token": { "type": "string" },
-              "claimed": { "type": ["string", "null"] },
-              "found": { "type": "boolean" },
-              "mismatch": {
-                "type": "boolean",
-                "description": "A token was reported but did not match -- treat as fabricated, not as evidence of parsing."
-              }
-            }
-          }
+          "items": { "$ref": "#/$defs/canaryObservation" }
         },
         "outcome": { "type": "string", "enum": ["pass", "fail", "partial", "inconclusive"] },
         "failureStage": {
           "type": "string",
-          "description": "Where the failure occurred. Naming the stage is the core output of this skill.",
           "enum": [
             "client-validation", "upload", "transport", "ingestion", "connector",
             "sharepoint-retrieval", "onedrive-retrieval", "parsing", "indexing",
-            "runtime-transfer", "context-handling", "tool-invocation",
-            "downstream-api", "generated-output", "accepted", "transferred",
-            "processed", "retrievable", "coverage", "none", "unknown"
+            "runtime-transfer", "context-handling", "tool-invocation", "downstream-api",
+            "generated-output", "coverage", "none", "unknown"
           ]
         },
         "error": { "type": ["string", "null"] },

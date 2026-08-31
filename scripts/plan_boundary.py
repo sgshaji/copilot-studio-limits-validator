@@ -1,155 +1,117 @@
 #!/usr/bin/env python3
-"""Boundary planner: decides the next size worth testing, or declares convergence.
-
-Reads an observation ledger and applies bisection between the largest passing
-input and the smallest failing one. This is what stops the skill from testing
-every value in a range, and -- more importantly -- it is what stops it from
-stopping too early.
-
-It also refuses to converge on unreliable evidence:
-
-* **Non-monotonic results** (something larger passed while something smaller
-  failed) mean the boundary is not a clean size threshold. That is usually
-  intermittency, throttling, or a timeout -- not a product limit -- and the
-  planner asks for repeat trials instead of reporting a boundary.
-* **Single-trial boundaries** are reported with `repeatsRecommended`, because
-  one failure can be a transient service condition.
-
-Run standalone:
-
-    python plan_boundary.py --ledger run.json
-    python plan_boundary.py --ledger run.json --tolerance 1MB --min-trials 2
-    python plan_boundary.py --ledger run.json --json
-
-Standard library only.
-"""
+"""Plan the next bounded validation probe for any numeric metric."""
 from __future__ import annotations
 
 import argparse
 import json
 
-import make_test_file as mtf
+import metrics
 import record_result as rr
 
 
-def _aggregate(ledger: dict) -> dict[int, dict]:
-    """Collapse trials per size. A size is only PASS if every trial passed."""
-    by_size: dict[int, dict] = {}
+def _aggregate(ledger: dict) -> dict[float, dict]:
+    by_value: dict[float, dict] = {}
     for obs in ledger.get("observations", []):
-        size = obs.get("bytes")
-        if size is None:
+        metric = obs.get("metric") or {}
+        value = metric.get("value")
+        if not isinstance(value, (int, float)):
             continue
-        slot = by_size.setdefault(size, {"size": size, "outcomes": [], "files": set()})
-        slot["outcomes"].append(obs["outcome"])
-        slot["files"].add(obs["file"])
-    for slot in by_size.values():
+        value = float(value)
+        slot = by_value.setdefault(value, {"value": value, "outcomes": [], "subjects": set()})
+        slot["outcomes"].append(obs.get("outcome", "inconclusive"))
+        slot["subjects"].add(obs.get("subject", ""))
+    for slot in by_value.values():
         outcomes = slot["outcomes"]
         slot["trials"] = len(outcomes)
-        if all(o == "pass" for o in outcomes):
+        if outcomes and all(o == "pass" for o in outcomes):
             slot["verdict"] = "pass"
-        elif all(o in ("fail", "partial") for o in outcomes):
+        elif outcomes and all(o in ("fail", "partial") for o in outcomes):
             slot["verdict"] = "fail"
         else:
             slot["verdict"] = "inconsistent"
-        slot["files"] = sorted(slot["files"])
-    return by_size
+        slot["subjects"] = sorted(slot["subjects"])
+    return by_value
 
 
-def plan(ledger: dict, tolerance: int = 1024 * 1024, min_trials: int = 1) -> dict:
-    by_size = _aggregate(ledger)
-    if not by_size:
+def plan(ledger: dict, tolerance: float | None = None, min_trials: int = 2) -> dict:
+    unit = ledger.get("metric", {}).get("unit", "units")
+    tolerance = metrics.default_tolerance(unit) if tolerance is None else float(tolerance)
+    by_value = _aggregate(ledger)
+    if not by_value:
         return {
-            "status": "no-data",
-            "recommendation": "Build and upload a test pack first.",
-            "nextSize": None,
+            "status": "no-data", "metric": ledger.get("metric", {}),
+            "recommendation": "Record at least one numeric observation first.",
+            "nextValue": None,
         }
 
-    passes = sorted(s for s, v in by_size.items() if v["verdict"] == "pass")
-    fails = sorted(s for s, v in by_size.items() if v["verdict"] == "fail")
-    inconsistent = sorted(s for s, v in by_size.items() if v["verdict"] == "inconsistent")
-
-    result: dict = {
-        "status": "",
+    passes = sorted(v for v, item in by_value.items() if item["verdict"] == "pass")
+    fails = sorted(v for v, item in by_value.items() if item["verdict"] == "fail")
+    inconsistent = sorted(v for v, item in by_value.items() if item["verdict"] == "inconsistent")
+    result = {
+        "status": "", "metric": ledger.get("metric", {}),
         "largestPass": passes[-1] if passes else None,
         "smallestFail": fails[0] if fails else None,
-        "inconsistentSizes": inconsistent,
-        "nextSize": None,
-        "recommendation": "",
-        "repeatsRecommended": [],
+        "inconsistentValues": inconsistent, "nextValue": None,
+        "repeatsRecommended": [], "recommendation": "",
     }
 
     if inconsistent:
         result["status"] = "inconsistent"
-        result["recommendation"] = (
-            "The same size both passed and failed across trials. Treat this as "
-            "intermittency (throttling, timeout, transient service state), not a "
-            "size limit. Repeat these sizes before concluding anything: "
-            + ", ".join(mtf.human_size(s) for s in inconsistent)
-        )
         result["repeatsRecommended"] = inconsistent
+        result["recommendation"] = (
+            "The same test value produced different outcomes across trials. Treat this as intermittency or another governing variable, not a clean limit. Repeat: "
+            + ", ".join(metrics.format_metric(v, unit) for v in inconsistent)
+        )
         return result
 
-    # A larger input passing while a smaller one failed means size is not the
-    # governing variable.
     if passes and fails and passes[-1] > fails[0]:
         result["status"] = "non-monotonic"
-        result["recommendation"] = (
-            f"{mtf.human_size(passes[-1])} passed but {mtf.human_size(fails[0])} "
-            "failed. Size is not the governing variable here -- suspect a timeout, "
-            "throttle, page/complexity limit, or transient failure. Repeat both "
-            "sizes and check the failure stage before reporting a boundary."
-        )
         result["repeatsRecommended"] = [fails[0], passes[-1]]
-        return result
-
-    if not fails:
-        largest = passes[-1]
-        result["status"] = "no-upper-bound"
-        result["nextSize"] = largest * 2
         result["recommendation"] = (
-            f"Everything up to {mtf.human_size(largest)} passed and nothing has "
-            f"failed yet. Test {mtf.human_size(largest * 2)} to find an upper bound."
+            f"{metrics.format_metric(passes[-1], unit)} passed while "
+            f"{metrics.format_metric(fails[0], unit)} failed. The selected metric is not behaving monotonically. Repeat both values and investigate confounders before reporting a boundary."
         )
         return result
 
     if not passes:
-        smallest = fails[0]
-        nxt = max(1024, smallest // 2)
         result["status"] = "no-lower-bound"
-        result["nextSize"] = nxt
         result["recommendation"] = (
-            f"Everything failed, smallest at {mtf.human_size(smallest)}. Test "
-            f"{mtf.human_size(nxt)} to establish a working baseline -- and confirm "
-            "the failure is about size at all, since a baseline that also fails "
-            "means something else is wrong."
+            "No working baseline has been demonstrated. Test a smaller, known-safe value. If that also fails, stop treating this as a boundary problem and investigate configuration or capability support."
+        )
+        return result
+
+    if not fails:
+        result["status"] = "no-upper-bound"
+        result["recommendation"] = (
+            "All tested values passed. Do not automatically keep doubling or expanding the workload. Choose a new upper bracket from official guidance or an explicit user-approved safe cap, then test within that bounded range."
         )
         return result
 
     lo, hi = passes[-1], fails[0]
     gap = hi - lo
-    thin = [s for s in (lo, hi) if by_size[s]["trials"] < min_trials]
-
+    thin = [v for v in (lo, hi) if by_value[v]["trials"] < min_trials]
     if gap <= tolerance:
         result["status"] = "converged"
         result["boundaryLow"] = lo
         result["boundaryHigh"] = hi
         result["repeatsRecommended"] = thin
         result["recommendation"] = (
-            f"Boundary located between {mtf.human_size(lo)} (pass) and "
-            f"{mtf.human_size(hi)} (fail); interval {mtf.human_size(gap)} is within "
-            f"the {mtf.human_size(tolerance)} tolerance."
-            + (
-                " Repeat the boundary sizes before publishing -- they have only "
-                f"{min_trials - 1} confirming trial(s)." if thin else ""
-            )
+            f"Boundary located between {metrics.format_metric(lo, unit)} (pass) and "
+            f"{metrics.format_metric(hi, unit)} (fail)."
+            + (" Repeat both boundary values before publishing." if thin else "")
         )
         return result
 
+    next_value = metrics.midpoint(lo, hi, unit)
+    if next_value <= lo:
+        next_value = lo + 1
+    if next_value >= hi:
+        next_value = hi - 1
     result["status"] = "bisect"
-    result["nextSize"] = lo + gap // 2
+    result["nextValue"] = next_value
     result["recommendation"] = (
-        f"Boundary is between {mtf.human_size(lo)} and {mtf.human_size(hi)} "
-        f"({mtf.human_size(gap)} apart). Test {mtf.human_size(result['nextSize'])} next."
+        f"Boundary remains between {metrics.format_metric(lo, unit)} and "
+        f"{metrics.format_metric(hi, unit)}. Test {metrics.format_metric(next_value, unit)} next while holding all other variables constant."
     )
     return result
 
@@ -157,30 +119,25 @@ def plan(ledger: dict, tolerance: int = 1024 * 1024, min_trials: int = 1) -> dic
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--ledger", required=True)
-    ap.add_argument("--tolerance", default="1MB",
-                    help="stop bisecting once the pass/fail gap is this small")
-    ap.add_argument("--min-trials", type=int, default=2,
-                    help="trials required at the boundary before it is publishable")
+    ap.add_argument("--tolerance", help="numeric tolerance in the ledger unit; byte metrics also accept 1MB, 512KB, etc.")
+    ap.add_argument("--min-trials", type=int, default=2)
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
-
     ledger = rr.load(args.ledger)
-    out = plan(ledger, mtf.parse_size(args.tolerance), args.min_trials)
-
+    unit = ledger.get("metric", {}).get("unit", "units")
+    tolerance = None if args.tolerance is None else metrics.parse_metric(args.tolerance, unit)
+    out = plan(ledger, tolerance, args.min_trials)
     if args.json:
         print(json.dumps(out, indent=2))
-        return 0
-
-    print(f"status: {out['status'].upper()}")
-    if out.get("largestPass") is not None:
-        print(f"  largest pass : {mtf.human_size(out['largestPass'])}")
-    if out.get("smallestFail") is not None:
-        print(f"  smallest fail: {mtf.human_size(out['smallestFail'])}")
-    if out.get("nextSize"):
-        print(f"  next size    : {mtf.human_size(out['nextSize'])} ({out['nextSize']} bytes)")
-        print(f"\n  python build_test_pack.py --mode size --sweep {out['nextSize']}B "
-              f"--out-dir pack-next")
-    print(f"\n{out['recommendation']}")
+    else:
+        print(f"status: {out['status'].upper()}")
+        if out.get("largestPass") is not None:
+            print(f"largest pass : {metrics.format_metric(out['largestPass'], unit)}")
+        if out.get("smallestFail") is not None:
+            print(f"smallest fail: {metrics.format_metric(out['smallestFail'], unit)}")
+        if out.get("nextValue") is not None:
+            print(f"next value   : {metrics.format_metric(out['nextValue'], unit)}")
+        print(out["recommendation"])
     return 0
 
 

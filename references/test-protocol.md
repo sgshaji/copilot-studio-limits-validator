@@ -1,128 +1,73 @@
 # Test protocol
 
-The methodology this skill implements. The short version: **an accepted input
-is not a working input**, and **a model saying it read something is not
-evidence that it did**.
+## 1. Frame one boundary at a time
 
-## 1. Name the capability *and* the ingestion path
+Record the capability, path, numeric metric, unit, success criterion, and variables that must remain constant. Results do not transfer automatically between direct upload, knowledge upload, SharePoint, OneDrive, tools, generated outputs, and runtime execution.
 
-Copilot Studio has no single universal file limit. Different subsystems
-enforce different boundaries, so a result is meaningless without the path
-attached. Test and report one path at a time:
+## 2. Record official guidance before measuring
 
-| Path key | What it covers |
+Use current first-party Microsoft guidance. Record the exact source and unit. If no authoritative figure exists, use `no-published-limit` rather than inventing one.
+
+## 3. Change one governing variable
+
+Examples:
+
+- file-size test: vary bytes, hold format/page count/content pattern constant;
+- page-count test: vary pages, hold file byte size/format/content pattern constant;
+- attachment-count test: vary attachment count, keep per-file size/format/content pattern constant;
+- tool-response test: vary response size/records, hold tool contract and request semantics constant.
+
+If the supposedly controlled variables change materially, the result is confounded.
+
+## 4. Distinguish lifecycle evidence
+
+| Stage | What it means |
 | --- | --- |
-| `direct-upload` | A file the user attaches in the conversation |
-| `agent-knowledge` | A file uploaded as agent knowledge at design time |
-| `sharepoint` | A file reached through a SharePoint knowledge source |
-| `sharepoint-library` | A whole library or folder as a source |
-| `onedrive` | A file reached through OneDrive |
-| `tool-input` | A file or payload passed *into* a tool/action |
-| `tool-output` | A payload returned *by* a tool/action |
-| `generated-output` | A file the agent produces and hands back |
-| `runtime` | Execution duration, temp storage, subprocess behaviour |
+| `accepted` | client/UI/API accepted the input |
+| `transferred` | input became available to the agent/runtime |
+| `processed` | a directly observed processing/indexing/parsing signal succeeded |
+| `retrievable` | at least some target content was available to the agent |
+| `coverage` | all selected end-to-end probe positions were demonstrated |
 
-Never generalise a measurement from one path to another. Use the comparison
-table in the report instead -- the *differences between paths* are usually the
-most valuable finding.
+Do not mark an internal stage failed merely because a downstream canary was missing.
 
-## 2. Record the documented limit before testing
+## 5. Canary protocol
 
-Look up published guidance first and record it with its source URL, so the
-report can reconcile measured against documented. If no authoritative figure
-exists, say so explicitly -- `no-published-limit` is a legitimate and useful
-result. See `documented-limits.md`.
+Each selected position has an independently random token. The token is not derived from run id, page number, filename, or any visible value.
 
-Recording it first also protects against the obvious bias: it is much easier
-to "confirm" a number you already believe once you have seen the results.
+1. Generate the pack.
+2. Keep `manifest.json` hidden from the model.
+3. Give the model `probe-sheet.md` only.
+4. Capture exact claimed tokens.
+5. Verify the claims against the manifest after the claims have been captured.
 
-## 3. Generate the whole sweep before testing any of it
+A correct canary proves end-to-end availability for that position during that probe. A miss means end-to-end availability was not demonstrated. It does not, alone, prove parsing failure.
 
-Build every artefact in one run with `build_test_pack.py`. The agent cannot
-upload files to itself, so every ingestion test needs a human. Batching turns
-N round trips into one, which is the difference between a test that gets
-finished and one that does not.
+## 6. Boundary search
 
-Sizes bracket the suspected limit: well below, just below, at, just above,
-well above. Keep every other variable constant -- same format, same page
-count, same content shape -- so the only thing varying is the thing being
-measured.
+Bracket with a known pass and known fail, then bisect. Repeat both boundary values before publishing.
 
-## 4. Walk the full lifecycle, not just the first stage
+Stop and investigate when:
 
-Record each stage separately:
+- the same value sometimes passes and sometimes fails;
+- a larger value passes while a smaller value fails;
+- a baseline fails;
+- a result depends on another variable that was not held constant.
 
-| Stage | Question | Who can observe it |
-| --- | --- | --- |
-| `accepted` | Did the client/API take the file at all? | **The human.** The agent never sees a rejected upload. |
-| `transferred` | Can the agent see the artefact? | The agent |
-| `processed` | Did parsing/extraction/indexing complete? | The agent |
-| `retrievable` | Can *any* content be read back? | The agent |
-| `coverage` | Can content be read from **every** probed position? | The agent, via canaries |
+When no upper fail exists, do **not** automatically keep doubling. Choose a safe upper bracket from official guidance or obtain an explicit user-approved cap.
 
-The gap between `accepted` and `coverage` is where the expensive failures
-live: the platform takes a 50 MB file, reports no error, and quietly gives the
-model the first few pages. Nothing surfaces that except position-addressed
-probing.
+## 7. Attachment-count tests
 
-## 5. Probe canaries without seeing the answers
+Each count is a separate scenario and must be uploaded in a separate turn. A 5-file and a 10-file case cannot be tested by uploading 15 files once and retrospectively treating subsets as separate observations.
 
-Every generated artefact carries unguessable tokens at known page positions.
+## 8. Reconciliation
 
-1. Read `probe-sheet.md` -- it lists the positions and **withholds the tokens**.
-2. Do **not** open `manifest.json` first. It contains the expected tokens, and
-   an agent that has seen them can report them back without ever opening the
-   document. That is not a measurement; it is an echo.
-3. Ask for the exact token at each position, one artefact at a time.
-4. Pass what was actually reported to
-   `record_result.py --canaries-claimed "1=<token>,5=<token>,..."`.
+- `match`: measured interval is consistent with the published boundary;
+- `more-restrictive-than-documented`: reliable pass stopped below it;
+- `more-permissive-than-documented`: values above it worked, but remain unsupported headroom;
+- `no-published-limit`: scoped measurement only;
+- `inconclusive`: evidence is insufficient.
 
-The script compares each claim against the manifest. A token that does not
-match verbatim is scored as **not found** and flagged as fabricated. Because
-the tokens are random, a correct answer cannot be produced by guessing -- so a
-hit is real evidence the page was parsed, and a miss is real evidence it was
-not.
+## 9. Scope
 
-## 6. Converge deliberately
-
-Run `plan_boundary.py` after each round. It bisects between the largest pass
-and the smallest fail, and it refuses to converge when the evidence is not
-clean:
-
-* **Non-monotonic** -- something larger passed while something smaller failed.
-  Size is not the governing variable. Suspect a timeout, a throttle, a
-  page-count or complexity limit, or a transient failure.
-* **Inconsistent** -- the same size both passed and failed across trials. That
-  is intermittency, not a limit.
-
-In both cases the correct action is repeat trials, not a conclusion.
-
-## 7. Repeat before publishing
-
-A single failure can be a transient service condition. Boundary sizes need at
-least two consistent trials before they are reported as a boundary. The
-planner tracks this and will tell you when the boundary is thinly evidenced.
-
-## 8. Classify the evidence honestly
-
-| Class | Meaning |
-| --- | --- |
-| `Official guidance + Measured` | A published limit exists and was tested |
-| `Measured` | Observed here; no published limit was found |
-
-And reconcile:
-
-| Verdict | Meaning |
-| --- | --- |
-| `match` | Measured behaviour reproduces the documented limit |
-| `more-restrictive-than-documented` | Reliable processing stopped below the documented figure -- design to the measured value |
-| `more-permissive-than-documented` | Larger inputs worked, but **this is not supported capability** and can be withdrawn without notice |
-| `no-published-limit` | Measured only; must not be quoted as a product limit |
-| `inconclusive` | Nothing passed every stage |
-
-## 9. State the scope of the result
-
-Every measurement is scoped to the tenant, environment, licence, harness,
-region and date it was taken in, and any service update can change it. The
-report says this at the top; do not strip it when quoting figures. A number
-without its scope is how a measurement becomes a myth.
+Always state that observations are scoped to the tested environment, path, tenant configuration, region, licence, harness/service version, downstream dependencies, and date. Do not convert one scoped observation into an unconditional product claim.

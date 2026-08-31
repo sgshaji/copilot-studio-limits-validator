@@ -1,39 +1,13 @@
 #!/usr/bin/env python3
-"""Batched test-pack builder for Copilot Studio limit validation.
+"""Build controlled Copilot Studio limit-validation test packs.
 
-A skill runs *inside* the agent, but file upload happens *before* the agent is
-invoked -- so the agent cannot upload artefacts to itself. Testing a boundary
-one file at a time would mean a human round trip per probe, and nobody
-finishes that.
+Modes:
+  size     vary bytes while holding page count constant
+  pages    vary page count while holding file size constant
+  formats  compare formats at one fixed byte size/page count
+  count    create separate attachment-count scenarios (one turn per scenario)
 
-This script front-loads the whole sweep instead: generate every artefact in
-one run, hand the folder to the human **once**, then probe all of them
-autonomously. N round trips collapse to 1.
-
-Run standalone:
-
-    # size sweep around a documented 50 MB limit
-    python build_test_pack.py --mode size --around 50MB --format pdf --pages 60 \
-        --out-dir pack
-
-    # explicit sizes
-    python build_test_pack.py --mode size --sweep 1MB,5MB,10MB,25MB \
-        --format docx --out-dir pack
-
-    # page-count sweep (each file as small as its page count allows)
-    python build_test_pack.py --mode pages --sweep 10,50,100,250,500 \
-        --format pdf --out-dir pack
-
-    # same size across every format, to compare per-format handling
-    python build_test_pack.py --mode formats --size 10MB --out-dir pack
-
-    # N small files, to find the attachment-count limit
-    python build_test_pack.py --mode count --count 20 --format pdf --out-dir pack
-
-Writes the artefacts, a machine-readable `manifest.json`, and an `UPLOAD-ME.md`
-containing the exact human instructions for the single upload step.
-
-Standard library only.
+The manifest contains secret canaries. The probe sheet never does.
 """
 from __future__ import annotations
 
@@ -44,271 +18,247 @@ import os
 from datetime import datetime, timezone
 
 import make_test_file as mtf
+import metrics
 
 BUILDER_ID = "limits-validator-test-pack"
-BUILDER_VERSION = "0.1.0"
-
+BUILDER_VERSION = "0.2.0"
 MODES = ("size", "pages", "formats", "count")
 
 
 def sweep_around(centre: int) -> list[int]:
-    """Sizes bracketing a suspected limit: well below, just below, at, just
-    above, well above. `step` is 1 MB or 2% of the centre, whichever is larger,
-    so the pack stays informative at both small and large scales."""
     step = max(1024 * 1024, int(centre * 0.02))
-    raw = [
-        int(centre * 0.2),
-        int(centre * 0.8),
-        centre - step,
-        centre,
-        centre + step,
-        int(centre * 1.2),
-    ]
+    raw = [int(centre * 0.2), int(centre * 0.8), centre - step,
+           centre, centre + step, int(centre * 1.2)]
     return sorted({s for s in raw if s > 0})
 
 
-def _label(n: int) -> str:
+def _label_bytes(n: int) -> str:
     if n % (1024 ** 2) == 0:
-        return f"{n // 1024 ** 2}MB"
+        return f"{n // 1024 ** 2}MiB"
     if n % 1024 == 0:
-        return f"{n // 1024}KB"
+        return f"{n // 1024}KiB"
     return f"{n}B"
 
 
-def _pages_for(fmt: str, target: int, requested: int) -> int:
-    """Never ask for more pages than the target size can structurally hold."""
-    if requested > 0:
-        return requested
-    return 10
-
-
-def artefact_run_id(pack_id: str, name: str) -> str:
-    """Each artefact gets its own run id, so canary tokens are unique per file.
-
-    Without this every file in a pack would carry identical tokens and a
-    retrieved token could not be attributed to the file it came from --
-    which is exactly what attachment-count and per-format tests need to know.
-    """
+def _artifact_run_id(pack_id: str, name: str) -> str:
+    # Public attribution id only. Canary values are independently random.
     return hashlib.sha256(f"{pack_id}|{name}".encode()).hexdigest()[:6].upper()
 
 
-def build(mode: str, out_dir: str, fmt: str = "pdf", sizes: list[int] | None = None,
-          pages_list: list[int] | None = None, pages: int = 0, size: int = 0,
-          count: int = 0, run_id: str | None = None) -> dict:
+def _round_up(n: int, quantum: int = 1024) -> int:
+    return ((n + quantum - 1) // quantum) * quantum
+
+
+def build(mode: str, out_dir: str, fmt: str = "pdf",
+          sizes: list[int] | None = None, pages_list: list[int] | None = None,
+          pages: int = 10, fixed_size: int = 0,
+          counts: list[int] | None = None, run_id: str | None = None) -> dict:
     os.makedirs(out_dir, exist_ok=True)
-    rid = run_id or mtf.new_run_id()
-    entries: list[dict] = []
+    pack_id = run_id or mtf.new_run_id()
+    artefacts: list[dict] = []
+    scenarios: list[dict] = []
     skipped: list[dict] = []
 
-    def emit(f_fmt: str, target: int, n_pages: int, name: str) -> None:
+    def emit(name: str, f_fmt: str, target: int, n_pages: int,
+             metric: dict, scenario: str | None = None) -> dict | None:
         path = os.path.join(out_dir, name)
-        try:
-            entry = mtf.run(f_fmt, target, n_pages, artefact_run_id(rid, name), path)
-        except ValueError as exc:
-            skipped.append({"file": name, "reason": str(exc)})
-            return
+        entry = mtf.run(f_fmt, target, n_pages, _artifact_run_id(pack_id, name), path)
         if not entry["exactSize"]:
-            os.remove(path)
-            skipped.append({
-                "file": name,
-                "reason": (
-                    f"{n_pages} pages need at least {entry['minimumBytes']} bytes; "
-                    f"cannot produce {target}"
-                ),
-            })
-            return
-        entries.append(entry)
+            if os.path.exists(path):
+                os.remove(path)
+            skipped.append({"file": name, "reason": f"structural minimum {entry['minimumBytes']} bytes exceeds target {target}"})
+            return None
+        entry["metric"] = metric
+        if scenario:
+            entry["scenario"] = scenario
+        artefacts.append(entry)
+        return entry
 
     if mode == "size":
+        metric_name, metric_unit = "file-size", "bytes"
         for target in sizes or []:
-            emit(fmt, target, _pages_for(fmt, target, pages),
-                 f"{fmt}-{_label(target)}.{fmt}")
+            emit(f"{fmt}-{_label_bytes(target)}.{fmt}", fmt, target, pages,
+                 {"name": metric_name, "value": target, "unit": metric_unit})
 
     elif mode == "pages":
-        for n in pages_list or []:
-            # Smallest artefact that holds n pages: probe the structural floor,
-            # then round up so the size stays a clean, reportable number.
-            name = f"{fmt}-{n}pages.{fmt}"
-            floor = len(mtf._BUILDERS[fmt](n, artefact_run_id(rid, name), 0))
-            target = size if size else ((floor // 1024) + 1) * 1024
-            emit(fmt, target, n, name)
+        metric_name, metric_unit = "page-count", "pages"
+        requested = pages_list or []
+        if not requested:
+            raise ValueError("page mode requires at least one page count")
+        largest_floor = max(mtf.minimum_size(fmt, n) for n in requested)
+        # Hold file size constant. If the caller does not choose a size, use one
+        # target that can structurally contain the largest requested document.
+        target = fixed_size or _round_up(largest_floor + 16 * 1024, 1024)
+        if target < largest_floor:
+            raise ValueError(
+                f"--size {target} bytes is too small for the largest page-count case; "
+                f"need at least {largest_floor} bytes. Increase --size so page count is "
+                "the only variable."
+            )
+        for n in requested:
+            emit(f"{fmt}-{n:05d}pages.{fmt}", fmt, target, n,
+                 {"name": metric_name, "value": n, "unit": metric_unit})
 
     elif mode == "formats":
+        metric_name, metric_unit = "format", "category"
+        if not fixed_size:
+            raise ValueError("formats mode requires --size")
         for f_fmt in mtf.FORMATS:
-            emit(f_fmt, size, _pages_for(f_fmt, size, pages),
-                 f"{f_fmt}-{_label(size)}.{f_fmt}")
+            emit(f"{f_fmt}-{_label_bytes(fixed_size)}.{f_fmt}", f_fmt, fixed_size, pages,
+                 {"name": metric_name, "value": f_fmt, "unit": metric_unit})
 
     elif mode == "count":
-        target = size or 64 * 1024
-        for i in range(1, count + 1):
-            emit(fmt, target, _pages_for(fmt, target, pages),
-                 f"{fmt}-{i:03d}-of-{count:03d}.{fmt}")
-
+        metric_name, metric_unit = "attachment-count", "attachments"
+        requested = counts or []
+        if not requested:
+            raise ValueError("count mode requires one or more counts")
+        target = fixed_size or 32 * 1024
+        for count in requested:
+            if count < 1:
+                raise ValueError("attachment counts must be >= 1")
+            scenario_id = f"count-{count:04d}"
+            members: list[str] = []
+            for i in range(1, count + 1):
+                name = f"{scenario_id}-{i:04d}.{fmt}"
+                entry = emit(name, fmt, target, 1,
+                             {"name": metric_name, "value": count, "unit": metric_unit},
+                             scenario_id)
+                if entry:
+                    members.append(name)
+            scenarios.append({
+                "id": scenario_id,
+                "metric": {"name": metric_name, "value": count, "unit": metric_unit},
+                "files": members,
+                "totalBytes": sum(a["actualBytes"] for a in artefacts if a.get("scenario") == scenario_id),
+            })
     else:
         raise ValueError(f"unknown mode {mode!r}")
 
     return {
         "builder": {"id": BUILDER_ID, "version": BUILDER_VERSION},
-        "packId": rid,
+        "packId": pack_id,
         "mode": mode,
         "generatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "artefactCount": len(entries),
-        "artefacts": entries,
+        "metric": {"name": metric_name, "unit": metric_unit},
+        "artefactCount": len(artefacts),
+        "totalBytes": sum(a["actualBytes"] for a in artefacts),
+        "artefacts": artefacts,
+        "scenarios": scenarios,
         "skipped": skipped,
     }
 
 
-UPLOAD_TEMPLATE = """# Upload instructions -- run {run_id}
-
-This pack was generated in one batch **so you only have to upload once**.
-
-## What to do
-
-1. Attach **all {count} files** in `{out_dir}` to the agent in a single turn if
-   the channel allows it. If it does not, attach them in as few turns as
-   possible and tell the agent which files went in which turn.
-2. Note anything the **client** rejected before sending -- a file greyed out,
-   an error toast, an attachment silently dropped. That is a real observation
-   ("failure stage: client validation") and the agent cannot see it.
-3. Tell the agent you have finished uploading.
-
-The agent then probes each artefact by asking for its canary tokens, and
-records which lifecycle stage each file reached.
-
-## Do not
-
-- Rename the files. The agent matches them to the manifest by name.
-- Open and re-save them in Office. That rewrites the package and changes the
-  byte size, which invalidates the size measurement.
-- Convert or compress them.
-
-## Files in this pack
-
-{table}
-
-## What the canaries are for
-
-Each artefact carries unguessable tokens at known page positions. Asking a
-model "can you read the end of this document?" proves nothing -- it will
-produce something plausible. Asking for the exact token on a named page
-cannot be answered by guessing, so a missing token is real evidence that the
-page was never parsed.
-
-{skipped_block}"""
-
-
-def write_upload_instructions(manifest: dict, out_dir: str) -> str:
-    rows = ["| File | Format | Size | Pages | Canaries |",
-            "| --- | --- | ---: | ---: | ---: |"]
-    for a in manifest["artefacts"]:
-        rows.append(
-            f"| `{a['file']}` | {a['format']} | {mtf.human_size(a['actualBytes'])} "
-            f"| {a['pages']} | {len(a['canaries'])} |"
-        )
-    skipped_block = ""
-    if manifest["skipped"]:
-        lines = "\n".join(f"- `{s['file']}` -- {s['reason']}" for s in manifest["skipped"])
-        skipped_block = f"## Not generated\n\n{lines}\n"
-
-    text = UPLOAD_TEMPLATE.format(
-        run_id=manifest["packId"],
-        count=manifest["artefactCount"],
-        out_dir=out_dir,
-        table="\n".join(rows),
-        skipped_block=skipped_block,
-    )
-    path = os.path.join(out_dir, "UPLOAD-ME.md")
+def write_probe_sheet(manifest: dict, out_dir: str) -> str:
+    lines = [
+        f"# Probe sheet — pack {manifest['packId']}", "",
+        "This sheet contains probe positions but **not** expected tokens.",
+        "Do not inspect `manifest.json` until after the model has returned its claims.", "",
+    ]
+    if manifest["mode"] == "count":
+        lines.append("## Attachment-count scenarios")
+        lines.append("")
+        lines.append("Upload each scenario in a **separate conversation turn**. Mixing scenarios invalidates the count measurement.")
+        lines.append("")
+        by_file = {a["file"]: a for a in manifest["artefacts"]}
+        for s in manifest["scenarios"]:
+            lines.append(f"### `{s['id']}` — {int(s['metric']['value'])} attachments")
+            for name in s["files"]:
+                pages = ", ".join(str(c["page"]) for c in by_file[name]["canaries"])
+                lines.append(f"- `{name}` — probe position(s): {pages}")
+            lines.append("")
+    else:
+        for a in manifest["artefacts"]:
+            pages = ", ".join(str(c["page"]) for c in a["canaries"])
+            metric = a["metric"]
+            value = metrics.format_metric(metric["value"], metric["unit"]) if metric["unit"] != "category" else str(metric["value"])
+            lines.append(f"- `{a['file']}` — test value: {value}; probe positions: {pages}")
+    lines.extend([
+        "", "### Evidence rule", "",
+        "A correct token proves that content at that position was available end-to-end to the agent for this probe. ",
+        "A missing token proves only that end-to-end availability was **not demonstrated**; it does not, by itself, identify parsing, indexing, retrieval, or context handling as the failing stage.",
+    ])
+    path = os.path.join(out_dir, "probe-sheet.md")
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(text)
+        fh.write("\n".join(lines) + "\n")
     return path
 
 
-def write_probe_sheet(manifest: dict, out_dir: str) -> str:
-    """A token-free worksheet: which pages to probe, with the answers withheld.
-
-    `manifest.json` contains the expected tokens, so an agent that reads it
-    before probing can echo them back without ever looking at the document.
-    This sheet lists only the *positions*, so the agent has to actually read
-    the artefact. `record_result.py --canaries-claimed` then scores what it
-    reports against the manifest.
-    """
+def write_upload_instructions(manifest: dict, out_dir: str) -> str:
     lines = [
-        f"# Probe sheet -- pack {manifest['packId']}",
-        "",
-        "For each artefact below, ask the agent for the **exact canary token** on "
-        "each listed page, then record what it reports with:",
-        "",
-        "```",
-        "python record_result.py --ledger run.json --manifest manifest.json \\",
-        '    --file <artefact> --canaries-claimed "1=<token>,5=<token>,..."',
-        "```",
-        "",
-        "Do **not** read `manifest.json` before probing -- it holds the expected "
-        "tokens, and an agent that has seen them can report them without ever "
-        "opening the document. The tokens are deliberately withheld here.",
-        "",
+        f"# Upload instructions — pack {manifest['packId']}", "",
+        f"Generated artefacts: **{manifest['artefactCount']}**  ",
+        f"Total generated bytes: **{metrics.human_bytes(manifest['totalBytes'])}**", "",
+        "Synthetic content only. Do not rename, re-save, convert, or compress the files.", "",
     ]
-    for a in manifest["artefacts"]:
-        pages = ", ".join(str(c["page"]) for c in a["canaries"])
-        lines.append(
-            f"- `{a['file']}` -- {mtf.human_size(a['actualBytes'])}, "
-            f"{a['pages']} pages. Probe pages: {pages}"
-        )
-    lines.append("")
-    path = os.path.join(out_dir, "probe-sheet.md")
+    if manifest["mode"] == "count":
+        lines.extend([
+            "## Important: count tests are separate scenarios", "",
+            "Each attachment count must be tested in its own conversation turn. Upload only the files belonging to one scenario, record whether the client accepted all of them, then move to the next scenario.", "",
+        ])
+        for s in manifest["scenarios"]:
+            lines.append(f"- `{s['id']}`: {len(s['files'])} files, {metrics.human_bytes(s['totalBytes'])}")
+    else:
+        lines.extend([
+            "Upload the artefacts in as few turns as the channel permits. Record any file rejected by the client before send; the agent cannot observe a file it never received.", "",
+        ])
+    lines.extend([
+        "", "After upload, use `probe-sheet.md` to request exact canary values. Keep `manifest.json` hidden from the model until claims have been captured and are ready for verification.",
+    ])
+    path = os.path.join(out_dir, "UPLOAD-ME.md")
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(lines))
+        fh.write("\n".join(lines) + "\n")
     return path
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--mode", default="size", choices=MODES)
+    ap.add_argument("--mode", choices=MODES, default="size")
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--format", default="pdf", choices=mtf.FORMATS)
-    ap.add_argument("--sweep", help="comma-separated sizes (mode=size) or page counts (mode=pages)")
-    ap.add_argument("--around", help="suspected limit; auto-brackets it (mode=size)")
-    ap.add_argument("--size", help="fixed size for mode=formats / count")
-    ap.add_argument("--pages", type=int, default=0, help="pages per artefact")
-    ap.add_argument("--count", type=int, default=10, help="file count for mode=count")
-    ap.add_argument("--run-id", help="reuse a run id so canary tokens stay stable")
+    ap.add_argument("--format", choices=mtf.FORMATS, default="pdf")
+    ap.add_argument("--sweep", help="comma-separated sizes, page counts, or attachment counts")
+    ap.add_argument("--around", help="suspected byte-size limit for mode=size")
+    ap.add_argument("--size", help="fixed artefact size for pages/formats/count")
+    ap.add_argument("--pages", type=int, default=10, help="fixed page/slide/row count for size/formats")
+    ap.add_argument("--count", type=int, help="single attachment-count scenario; --sweep is preferred")
+    ap.add_argument("--run-id")
     args = ap.parse_args(argv)
 
     sizes: list[int] = []
     pages_list: list[int] = []
+    counts: list[int] = []
     if args.mode == "size":
         if args.around:
-            sizes = sweep_around(mtf.parse_size(args.around))
+            sizes = sweep_around(metrics.parse_bytes(args.around))
         elif args.sweep:
-            sizes = [mtf.parse_size(s) for s in args.sweep.split(",") if s.strip()]
+            sizes = [metrics.parse_bytes(v) for v in args.sweep.split(",") if v.strip()]
         else:
-            ap.error("mode=size needs --around or --sweep")
+            ap.error("size mode requires --around or --sweep")
     elif args.mode == "pages":
         if not args.sweep:
-            ap.error("mode=pages needs --sweep, e.g. --sweep 10,50,100,250")
-        pages_list = [int(s) for s in args.sweep.split(",") if s.strip()]
-    elif args.mode in ("formats", "count") and not args.size:
-        if args.mode == "formats":
-            ap.error("mode=formats needs --size")
+            ap.error("pages mode requires --sweep, e.g. 10,50,100,250")
+        pages_list = [int(v) for v in args.sweep.split(",") if v.strip()]
+    elif args.mode == "formats" and not args.size:
+        ap.error("formats mode requires --size")
+    elif args.mode == "count":
+        if args.sweep:
+            counts = [int(v) for v in args.sweep.split(",") if v.strip()]
+        elif args.count:
+            counts = [args.count]
+        else:
+            ap.error("count mode requires --sweep or --count")
 
     manifest = build(
-        args.mode, args.out_dir, args.format, sizes, pages_list, args.pages,
-        mtf.parse_size(args.size) if args.size else 0, args.count, args.run_id,
+        args.mode, args.out_dir, args.format, sizes=sizes, pages_list=pages_list,
+        pages=args.pages, fixed_size=metrics.parse_bytes(args.size) if args.size else 0,
+        counts=counts, run_id=args.run_id,
     )
-
     with open(os.path.join(args.out_dir, "manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
     write_upload_instructions(manifest, args.out_dir)
     write_probe_sheet(manifest, args.out_dir)
 
-    print(f"pack {manifest['packId']}  mode={manifest['mode']}  "
-          f"{manifest['artefactCount']} artefact(s) -> {args.out_dir}")
-    for a in manifest["artefacts"]:
-        print(f"  {a['file']:36} {mtf.human_size(a['actualBytes']):>10}  "
-              f"pages={a['pages']:<5} run={a['runId']}")
-    for s in manifest["skipped"]:
-        print(f"  SKIPPED {s['file']}: {s['reason']}")
-    print(f"\nNext: hand {args.out_dir}/UPLOAD-ME.md to the user, then probe canaries.")
+    print(f"pack {manifest['packId']}  mode={manifest['mode']}  artefacts={manifest['artefactCount']}  total={metrics.human_bytes(manifest['totalBytes'])}")
+    print(f"next: read {out_dir if (out_dir := args.out_dir) else args.out_dir}/UPLOAD-ME.md")
     return 0
 
 

@@ -1,35 +1,15 @@
 #!/usr/bin/env python3
-"""Render a Verified Limits Report from one or more observation ledgers.
-
-The report separates two numbers that are routinely conflated:
-
-* the **acceptance** boundary -- the largest input the platform took, and
-* the **usable** boundary -- the largest input whose content was fully
-  readable afterwards.
-
-A file that uploads cleanly but is only half parsed is not a passing test at
-that size, and reporting it as one is the specific mistake this skill exists
-to prevent.
-
-Run standalone:
-
-    python generate_report.py --ledger run.json --out report.md
-    python generate_report.py --ledger direct.json --ledger sharepoint.json \\
-        --out comparison.md          # cross-path comparison table
-
-Standard library only.
-"""
+"""Render a Verified Limits Report from one or more observation ledgers."""
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
 
-import make_test_file as mtf
+import metrics
 import plan_boundary as pb
 import record_result as rr
 
-REPORT_VERSION = "0.1.0"
-
+REPORT_VERSION = "0.2.0"
 _STAGE_LABEL = {
     "client-validation": "Client validation (rejected before send)",
     "upload": "Upload",
@@ -45,204 +25,160 @@ _STAGE_LABEL = {
     "tool-invocation": "Tool invocation",
     "downstream-api": "Downstream API",
     "generated-output": "Generated output",
-    "accepted": "Input acceptance",
-    "transferred": "Transfer to agent",
-    "processed": "Processing",
-    "retrievable": "Content retrieval",
-    "coverage": "Content coverage",
+    "coverage": "End-to-end content coverage",
     "none": "None",
     "unknown": "Not determined",
 }
 
 
 def _boundaries(ledger: dict) -> dict:
-    """Largest size that was accepted, and largest that was fully usable."""
-    accepted: list[int] = []
-    usable: list[int] = []
-    first_fail: int | None = None
-    fail_stage = "unknown"
-
-    by_size = pb._aggregate(ledger)
-    for size in sorted(by_size):
-        obs = [o for o in ledger["observations"] if o.get("bytes") == size]
-        if all(o["stages"].get("accepted") == "pass" for o in obs):
-            accepted.append(size)
-        if by_size[size]["verdict"] == "pass":
-            usable.append(size)
-        elif by_size[size]["verdict"] == "fail" and first_fail is None:
-            first_fail = size
-            stages = [o["failureStage"] for o in obs if o["failureStage"] not in ("none", None)]
-            fail_stage = stages[0] if stages else "unknown"
-
+    by_value = pb._aggregate(ledger)
+    passes = sorted(v for v, x in by_value.items() if x["verdict"] == "pass")
+    fails = sorted(v for v, x in by_value.items() if x["verdict"] == "fail")
+    acceptance: list[float] = []
+    for value in sorted(by_value):
+        obs = [o for o in ledger["observations"] if float((o.get("metric") or {}).get("value", -1)) == value]
+        if obs and all(o.get("stages", {}).get("accepted") == "pass" for o in obs):
+            acceptance.append(value)
+    first_fail = fails[0] if fails else None
+    failure_stage = "unknown"
+    if first_fail is not None:
+        obs = [o for o in ledger["observations"] if float((o.get("metric") or {}).get("value", -1)) == first_fail]
+        stages = [o.get("failureStage") for o in obs if o.get("failureStage") not in (None, "none")]
+        if stages:
+            # Only report the observed stage. 'coverage' means the internal cause
+            # was not isolated by the canary test.
+            failure_stage = stages[0]
     return {
-        "acceptance": max(accepted) if accepted else None,
-        "usable": max(usable) if usable else None,
+        "acceptance": max(acceptance) if acceptance else None,
+        "usable": max(passes) if passes else None,
         "firstFail": first_fail,
-        "failureStage": fail_stage,
-        "sizes": by_size,
+        "failureStage": failure_stage,
+        "values": by_value,
     }
 
 
-def reconcile(documented: int | None, b: dict) -> tuple[str, str]:
-    """Compare measured behaviour with published guidance."""
+def reconcile(documented: float | None, b: dict, unit: str) -> tuple[str, str]:
     usable, first_fail = b["usable"], b["firstFail"]
     if documented is None:
         return (
             "no-published-limit",
-            "No authoritative published limit was identified for this path. The "
-            "values below are measured observations only and must not be quoted "
-            "as a supported product limit.",
+            "No authoritative published limit was recorded for this path. The result below is a scoped measurement, not a supported product limit.",
         )
     if usable is None:
-        return ("inconclusive", "No size passed all lifecycle stages, so the "
-                               "documented limit could not be reconciled.")
+        return ("inconclusive", "No tested value passed the defined end-to-end success criterion, so the published limit could not be reconciled.")
     if first_fail is not None and usable <= documented < first_fail:
         return (
             "match",
-            f"Measured behaviour reproduces the documented {mtf.human_size(documented)} "
-            "limit: inputs at or below it completed every lifecycle stage, and the "
-            "first consistent failure sits above it.",
+            f"Measured behaviour is consistent with the documented boundary of {metrics.format_metric(documented, unit)} within the tested interval.",
         )
     if usable < documented:
         return (
             "more-restrictive-than-documented",
-            f"Documentation states {mtf.human_size(documented)}, but reliable "
-            f"end-to-end processing was only observed up to {mtf.human_size(usable)}. "
-            "Design to the measured value in this environment and raise the gap with "
-            "Microsoft rather than assuming the documented figure.",
+            f"The largest consistently usable value observed was {metrics.format_metric(usable, unit)}, below the documented {metrics.format_metric(documented, unit)}. Treat this as an environment-scoped discrepancy and investigate before relying on the documented value here.",
         )
     return (
         "more-permissive-than-documented",
-        f"Inputs above the documented {mtf.human_size(documented)} limit were "
-        f"processed successfully (up to {mtf.human_size(usable)}). This is "
-        "**not** a supported capability -- unsupported headroom can be removed "
-        "without notice. The documented value remains the boundary to design to.",
+        f"Values above the documented {metrics.format_metric(documented, unit)} boundary worked in this test, up to {metrics.format_metric(usable, unit)}. This is unsupported headroom, not a supported product capability; design to the documented boundary.",
     )
 
 
-def _evidence(documented: int | None) -> str:
-    return "Official guidance + Measured" if documented is not None else "Measured"
+def _stage(value: str) -> str:
+    return {"pass": "Pass", "fail": "Fail", "partial": "Partial", "unknown": "–", "not-tested": "n/t"}.get(value, value)
 
 
-def _stage_cell(value: str) -> str:
-    return {"pass": "Pass", "fail": "Fail", "partial": "Partial",
-            "unknown": "-", "not-tested": "n/t"}.get(value, value)
+def _evidence(ledger: dict) -> str:
+    return "Official guidance + Measured" if ledger.get("documentedLimit") else "Measured"
 
 
 def render_ledger(ledger: dict) -> str:
     b = _boundaries(ledger)
-    doc = (ledger.get("documentedLimit") or {}).get("bytes")
-    verdict, prose = reconcile(doc, b)
+    unit = ledger.get("metric", {}).get("unit", "units")
+    metric_name = ledger.get("metric", {}).get("name", "metric")
+    documented = (ledger.get("documentedLimit") or {}).get("value")
+    verdict, prose = reconcile(documented, b, unit)
     planning = pb.plan(ledger)
+    lines = [f"## {ledger['capability']}", "",
+             f"**Path:** `{ledger['path']}`  ",
+             f"**Metric:** {metric_name} ({unit})  "]
+    if documented is None:
+        lines.append("**Documented limit:** none identified  ")
+    else:
+        source = (ledger.get("documentedLimit") or {}).get("source")
+        src = f" ([source]({source}))" if source else ""
+        lines.append(f"**Documented limit:** {metrics.format_metric(documented, unit)}{src}  ")
+    lines.extend([
+        f"**Largest verified usable value:** {metrics.format_metric(b['usable'], unit)}  ",
+        f"**First consistent failing value:** {metrics.format_metric(b['firstFail'], unit)}  ",
+        f"**Largest explicitly accepted value:** {metrics.format_metric(b['acceptance'], unit)}  ",
+        f"**Observed failure stage:** {_STAGE_LABEL.get(b['failureStage'], b['failureStage'])}  ",
+        f"**Evidence:** {_evidence(ledger)}  ",
+        f"**Reconciliation:** `{verdict}`", "",
+        "### Result", "", prose, "",
+    ])
+    if planning["status"] != "converged":
+        lines.extend([f"> **Boundary status: `{planning['status']}`.** {planning['recommendation']}", ""])
+    if b["acceptance"] is not None and b["usable"] is not None and b["acceptance"] > b["usable"]:
+        lines.extend([
+            "> **Acceptance exceeds demonstrated usability.** The platform accepted a larger value than the largest value that met the end-to-end success criterion. Do not treat acceptance alone as capability.", ""
+        ])
 
-    lines: list[str] = []
-    lines.append(f"## {ledger['capability']}")
-    lines.append("")
-    lines.append(f"**Ingestion path:** `{ledger['path']}`  ")
-    lines.append(
-        "**Documented limit:** "
-        + (f"{mtf.human_size(doc)}" if doc else "none identified")
-        + (f" ([source]({ledger['documentedLimit']['source']}))"
-           if doc and (ledger.get('documentedLimit') or {}).get('source') else "")
-        + "  "
-    )
-    lines.append(
-        "**Observed input acceptance:** "
-        + (f"up to {mtf.human_size(b['acceptance'])}" if b["acceptance"] else "not established")
-        + "  "
-    )
-    lines.append(
-        "**Observed complete processing:** "
-        + (f"up to {mtf.human_size(b['usable'])}" if b["usable"] else "not established")
-        + "  "
-    )
-    lines.append(
-        "**First consistent failure:** "
-        + (mtf.human_size(b["firstFail"]) if b["firstFail"] else "none observed")
-        + "  "
-    )
-    lines.append(f"**Failure stage:** {_STAGE_LABEL.get(b['failureStage'], b['failureStage'])}  ")
-    lines.append(f"**Evidence:** {_evidence(doc)}  ")
-    lines.append(f"**Reconciliation:** `{verdict}`")
-    lines.append("")
-
-    if b["acceptance"] and b["usable"] and b["acceptance"] > b["usable"]:
+    lines.extend([
+        "### Test record", "",
+        "| Subject | Test value | Format | Bytes | Pages | Accept | Retrieve | Coverage | Trial | Outcome | Failure stage |",
+        "| --- | ---: | --- | ---: | ---: | --- | --- | --- | ---: | --- | --- |",
+    ])
+    for obs in sorted(ledger.get("observations", []), key=lambda o: (float((o.get("metric") or {}).get("value", 0)), o.get("trial", 1))):
+        m = obs.get("metric") or {}
+        s = obs.get("stages") or {}
+        canaries = obs.get("canaries") or []
+        cov = _stage(s.get("coverage", "unknown"))
+        if canaries:
+            hits = sum(1 for c in canaries if c.get("found"))
+            cov += f" ({hits}/{len(canaries)})"
         lines.append(
-            f"> **Acceptance exceeds usability.** Inputs up to "
-            f"{mtf.human_size(b['acceptance'])} were accepted, but content was only "
-            f"fully readable up to {mtf.human_size(b['usable'])}. Between those two "
-            "figures the platform takes the file and silently returns incomplete "
-            "content -- the most expensive failure mode, because nothing reports an "
-            "error."
-        )
-        lines.append("")
-
-    lines.append("### Result")
-    lines.append("")
-    lines.append(prose)
-    lines.append("")
-
-    if planning["status"] not in ("converged", "no-data"):
-        lines.append(f"> **Boundary not yet settled** (`{planning['status']}`). "
-                     f"{planning['recommendation']}")
-        lines.append("")
-
-    lines.append("### Test record")
-    lines.append("")
-    lines.append("| Artefact | Size | Pages | Accept | Process | Retrieve | Coverage | Trial | Outcome |")
-    lines.append("| --- | ---: | ---: | --- | --- | --- | --- | ---: | --- |")
-    for obs in sorted(ledger["observations"], key=lambda o: (o.get("bytes") or 0, o["trial"])):
-        s = obs["stages"]
-        cov = s.get("coverage", "unknown")
-        if obs["canaries"]:
-            hits = sum(1 for c in obs["canaries"] if c["found"])
-            cov = f"{_stage_cell(cov)} ({hits}/{len(obs['canaries'])})"
-        else:
-            cov = _stage_cell(cov)
-        lines.append(
-            f"| `{obs['file']}` | {mtf.human_size(obs['bytes']) if obs['bytes'] else '-'} "
-            f"| {obs['pages'] or '-'} | {_stage_cell(s.get('accepted','unknown'))} "
-            f"| {_stage_cell(s.get('processed','unknown'))} "
-            f"| {_stage_cell(s.get('retrievable','unknown'))} | {cov} "
-            f"| {obs['trial']} | **{obs['outcome']}** |"
+            f"| `{obs.get('subject','')}` | {metrics.format_metric(m.get('value'), m.get('unit', unit))} | {obs.get('format') or '–'} | "
+            f"{metrics.human_bytes(obs['bytes']) if obs.get('bytes') is not None else '–'} | {obs.get('pages') if obs.get('pages') is not None else '–'} | "
+            f"{_stage(s.get('accepted','unknown'))} | {_stage(s.get('retrievable','unknown'))} | {cov} | {obs.get('trial',1)} | **{obs.get('outcome','inconclusive')}** | {_STAGE_LABEL.get(obs.get('failureStage','unknown'), obs.get('failureStage','unknown'))} |"
         )
     lines.append("")
 
-    missing = [
-        (obs["file"], [c["page"] for c in obs["canaries"] if not c["found"]])
-        for obs in ledger["observations"] if any(not c["found"] for c in obs["canaries"])
-    ]
-    if missing:
-        lines.append("### Unparsed pages")
+    misses = []
+    for obs in ledger.get("observations", []):
+        failed = [c for c in obs.get("canaries", []) if not c.get("found")]
+        if failed:
+            misses.append((obs.get("subject", ""), failed))
+    if misses:
+        lines.extend([
+            "### Positions not demonstrated end-to-end", "",
+            "A missing canary means the model did not reproduce the expected token for that position. It does **not** by itself prove whether the cause was parsing, indexing, retrieval, context handling, or another internal stage.", "",
+        ])
+        for subject, failed in misses:
+            labels = []
+            for item in failed:
+                if item.get("file"):
+                    labels.append(item["file"])
+                else:
+                    labels.append(str(item.get("position", "?")))
+            lines.append(f"- `{subject}` — {', '.join(labels)}")
         lines.append("")
-        lines.append("Canary tokens that could not be retrieved. Because the tokens are "
-                     "random, a miss is positive evidence the page was never parsed -- "
-                     "not a retrieval preference.")
-        lines.append("")
-        for name, pages in missing:
-            lines.append(f"- `{name}` -- pages {', '.join(str(p) for p in pages)}")
-        lines.append("")
-
     return "\n".join(lines)
 
 
 def render_comparison(ledgers: list[dict]) -> str:
-    lines = ["## Path comparison", "",
-             "Copilot Studio has no single universal file limit -- different "
-             "subsystems enforce different boundaries. Comparing the same "
-             "capability across ingestion paths is usually more useful than any "
-             "single number.", "",
-             "| Path | Capability | Accepted to | Fully usable to | Failure stage | Evidence |",
-             "| --- | --- | ---: | ---: | --- | --- |"]
+    lines = [
+        "## Path comparison", "",
+        "Compare only ledgers measuring the same metric and success criterion. Different ingestion/runtime paths can impose different boundaries.", "",
+        "| Path | Capability | Metric | Largest usable | First fail | Failure stage | Evidence |",
+        "| --- | --- | --- | ---: | ---: | --- | --- |",
+    ]
     for ledger in ledgers:
         b = _boundaries(ledger)
-        doc = (ledger.get("documentedLimit") or {}).get("bytes")
+        unit = ledger.get("metric", {}).get("unit", "units")
         lines.append(
-            f"| `{ledger['path']}` | {ledger['capability']} "
-            f"| {mtf.human_size(b['acceptance']) if b['acceptance'] else 'not established'} "
-            f"| {mtf.human_size(b['usable']) if b['usable'] else 'not established'} "
-            f"| {_STAGE_LABEL.get(b['failureStage'], b['failureStage'])} "
-            f"| {_evidence(doc)} |"
+            f"| `{ledger['path']}` | {ledger['capability']} | {ledger.get('metric',{}).get('name','metric')} | "
+            f"{metrics.format_metric(b['usable'], unit)} | {metrics.format_metric(b['firstFail'], unit)} | "
+            f"{_STAGE_LABEL.get(b['failureStage'], b['failureStage'])} | {_evidence(ledger)} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -253,10 +189,7 @@ def build_report(ledgers: list[dict]) -> str:
     head = [
         "# Verified Limits Report", "",
         f"Generated {stamp} by `copilot-studio-limits-validator` v{REPORT_VERSION}.", "",
-        "Every figure below is an observation from **this environment**. Limits can "
-        "differ by tenant, environment, licence, harness and region, and can change "
-        "with any service update. Re-measure before relying on these numbers "
-        "elsewhere.", "",
+        "Every measured value is scoped to the environment and conditions in which it was observed. Product updates, tenant configuration, region, licence, harness, ingestion path, and downstream dependencies can change the result. Re-measure before generalising it.", "",
     ]
     body = [render_ledger(l) for l in ledgers]
     if len(ledgers) > 1:
@@ -266,16 +199,14 @@ def build_report(ledgers: list[dict]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--ledger", action="append", required=True,
-                    help="ledger JSON; repeat for a cross-path comparison")
-    ap.add_argument("--out", help="write Markdown here (default: stdout)")
+    ap.add_argument("--ledger", action="append", required=True)
+    ap.add_argument("--out")
     args = ap.parse_args(argv)
-
-    report = build_report([rr.load(p) for p in args.ledger])
+    report = build_report([rr.load(path) for path in args.ledger])
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
             fh.write(report)
-        print(f"wrote {args.out} ({len(report)} chars)")
+        print(f"wrote {args.out}")
     else:
         print(report)
     return 0

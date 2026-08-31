@@ -1,19 +1,19 @@
 {
   "name": "Copilot Studio Limits Validator",
-  "description": "Empirically validates Copilot Studio operating limits with controlled boundary tests -- probing below, at, and above a suspected threshold, proving which content is actually readable with unguessable canary tokens, naming the stage where processing fails, and reconciling what was measured against published Microsoft guidance.",
+  "description": "Empirically validates quantitative Copilot Studio operating boundaries using controlled, bounded experiments; separates acceptance from end-to-end usability, supports generic numeric metrics, and reconciles scoped measurements with official Microsoft guidance.",
   "platforms": ["Copilot Studio"],
   "tags": [
     "copilot-studio",
     "limits",
     "boundary-testing",
     "diagnostics",
-    "files",
     "measurement",
+    "validation",
     "scripts"
   ],
   "author": "Shaji Sivaraman",
-  "authorUrl": "https://github.com/shajisivaraman",
-  "version": "0.1.0",
+  "authorUrl": "https://github.com/sgshaji",
+  "version": "0.2.0",
   "createdAt": "2026-08-31",
   "updatedAt": "2026-08-31"
 }
