@@ -19,6 +19,11 @@ This skill validates live product boundaries with the minimum controlled workloa
 
 State the scenario count, artefact count, and total bytes before active testing.
 
+Check that figure against free space first. The agent sandbox holds a few
+hundred MB, and the pack is copied again when handed to the user, so a
+multi-path comparison generated up front can exhaust it mid-run. Build one pack
+at a time.
+
 ## Active-sensitive — explicit direction required
 
 - production agents or live-user environments;

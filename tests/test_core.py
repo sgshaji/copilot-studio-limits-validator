@@ -130,6 +130,36 @@ class PackIsolationTests(unittest.TestCase):
             self.assertIn("fresh conversation", text.lower())
 
 
+class CapacityTests(unittest.TestCase):
+    """A pack that cannot fit must be refused before any bytes are written."""
+
+    def test_planned_bytes_is_known_before_building(self):
+        self.assertEqual(btp.planned_bytes("size", sizes=[1024, 2048]), 3072)
+        self.assertEqual(btp.planned_bytes("pages", pages_list=[1, 2, 3], fixed_size=1024), 3072)
+        self.assertEqual(btp.planned_bytes("count", counts=[1, 3], fixed_size=1024), 4096)
+
+    def test_oversized_pack_is_refused_before_writing(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(ValueError) as ctx:
+                btp.build("size", td, "txt", sizes=[64 * 1024], max_total_bytes=1024)
+            self.assertIn("max-total-bytes", str(ctx.exception))
+            self.assertFalse(os.path.exists(os.path.join(td, btp.UPLOAD_DIR)))
+
+    def test_insufficient_free_space_is_refused_with_a_way_forward(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(ValueError) as ctx:
+                btp.check_capacity(td, 1024 ** 5)  # 1 PiB
+            message = str(ctx.exception)
+            self.assertIn("free", message)
+            self.assertIn("one pack at a time", message)
+
+    def test_space_check_can_be_skipped_deliberately(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = btp.build("size", td, "txt", sizes=[8192],
+                                 max_total_bytes=1, skip_space_check=True)
+            self.assertEqual(manifest["artefactCount"], 1)
+
+
 class ArtefactStructureTests(unittest.TestCase):
     def test_every_format_produces_a_structurally_valid_file(self):
         with tempfile.TemporaryDirectory() as td:

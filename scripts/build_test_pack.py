@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 from datetime import datetime, timezone
 
 import make_test_file as mtf
@@ -26,6 +27,11 @@ import metrics
 BUILDER_ID = "limits-validator-test-pack"
 BUILDER_VERSION = "0.3.0"
 UPLOAD_DIR = "upload"
+# The agent sandbox is small and the pack is usually copied once more when it is
+# handed to the user, so a pack needs materially more free space than its own
+# size. Refusing up front beats a half-written pack or an out-of-disk crash.
+SPACE_FACTOR = 1.5
+SPACE_MARGIN = 64 * 1024 ** 2
 MODES = ("size", "pages", "count")
 
 
@@ -53,11 +59,57 @@ def _round_up(n: int, quantum: int = 1024) -> int:
     return ((n + quantum - 1) // quantum) * quantum
 
 
+def planned_bytes(mode: str, sizes=None, pages_list=None, counts=None,
+                  fixed_size: int = 0) -> int:
+    """Total bytes the pack will occupy, before anything is written."""
+    if mode == "size":
+        return sum(sizes or [])
+    if mode == "pages":
+        return (fixed_size or 0) * len(pages_list or [])
+    if mode == "count":
+        return (fixed_size or 32 * 1024) * sum(counts or [])
+    return 0
+
+
+def check_capacity(out_dir: str, planned: int, max_total: int = 0) -> None:
+    """Refuse a pack that will not fit, with the arithmetic and a way forward.
+
+    This skill measures limits; running into an undocumented one of its own is
+    an avoidable irony. The failure mode being prevented is real: a four-path
+    comparison at 120 MiB per path fills a 900 MB sandbox.
+    """
+    if max_total and planned > max_total:
+        raise ValueError(
+            f"pack would occupy {metrics.human_bytes(planned)}, above the "
+            f"--max-total-bytes cap of {metrics.human_bytes(max_total)}. "
+            "Reduce the sweep, or raise the cap deliberately."
+        )
+    free = shutil.disk_usage(out_dir).free
+    needed = int(planned * SPACE_FACTOR) + SPACE_MARGIN
+    if needed > free:
+        raise ValueError(
+            f"pack would occupy {metrics.human_bytes(planned)} and needs about "
+            f"{metrics.human_bytes(needed)} of working space, but only "
+            f"{metrics.human_bytes(free)} is free.\n"
+            "Build one pack at a time rather than several at once: comparing "
+            "paths means one sweep per path, generated and uploaded in turn, "
+            "not all of them up front. Or narrow the sweep to a three-point "
+            "bracket (below, at, above) and bisect from there. Artefacts are "
+            "uploaded one per turn anyway, so generating the whole matrix in "
+            "advance buys nothing."
+        )
+
+
 def build(mode: str, out_dir: str, fmt: str = "pdf",
           sizes: list[int] | None = None, pages_list: list[int] | None = None,
           pages: int = 10, fixed_size: int = 0,
-          counts: list[int] | None = None, run_id: str | None = None) -> dict:
+          counts: list[int] | None = None, run_id: str | None = None,
+          max_total_bytes: int = 0, skip_space_check: bool = False) -> dict:
     os.makedirs(out_dir, exist_ok=True)
+    if not skip_space_check:
+        check_capacity(out_dir,
+                       planned_bytes(mode, sizes, pages_list, counts, fixed_size),
+                       max_total_bytes)
     upload_dir = os.path.join(out_dir, UPLOAD_DIR)
     os.makedirs(upload_dir, exist_ok=True)
     pack_id = run_id or mtf.new_run_id()
@@ -226,6 +278,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pages", type=int, default=10, help="fixed page/slide/row count for size mode")
     ap.add_argument("--count", type=int, help="single attachment-count scenario; --sweep is preferred")
     ap.add_argument("--run-id")
+    ap.add_argument("--max-total-bytes",
+                    help="refuse to build a pack larger than this, e.g. 256MB")
+    ap.add_argument("--skip-space-check", action="store_true",
+                    help="build even when free space looks insufficient")
     args = ap.parse_args(argv)
 
     sizes: list[int] = []
@@ -250,11 +306,16 @@ def main(argv: list[str] | None = None) -> int:
         else:
             ap.error("count mode requires --sweep or --count")
 
-    manifest = build(
-        args.mode, args.out_dir, args.format, sizes=sizes, pages_list=pages_list,
-        pages=args.pages, fixed_size=metrics.parse_bytes(args.size) if args.size else 0,
-        counts=counts, run_id=args.run_id,
-    )
+    try:
+        manifest = build(
+            args.mode, args.out_dir, args.format, sizes=sizes, pages_list=pages_list,
+            pages=args.pages, fixed_size=metrics.parse_bytes(args.size) if args.size else 0,
+            counts=counts, run_id=args.run_id,
+            max_total_bytes=metrics.parse_bytes(args.max_total_bytes) if args.max_total_bytes else 0,
+            skip_space_check=args.skip_space_check,
+        )
+    except ValueError as exc:
+        ap.error(str(exc))
     with open(os.path.join(args.out_dir, "manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
     write_upload_instructions(manifest, args.out_dir)

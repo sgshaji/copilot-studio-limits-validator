@@ -91,6 +91,17 @@ python scripts/build_test_pack.py --mode count --sweep 1,5,10,20 \
 
 Each count is a separate scenario needing its own **fresh conversation**: attachments from an earlier turn can remain in context and inflate the count actually under test.
 
+### Capacity
+
+The agent sandbox is small. One `--around 50MB` sweep is ~260 MiB, and the pack
+is copied again when handed to the user, so a four-path comparison generated up
+front will not fit. Build **one pack at a time**: comparing paths means one
+sweep per path, generated and uploaded in turn.
+
+`build_test_pack.py` checks free space before writing anything and refuses with
+the arithmetic rather than failing halfway through. `--max-total-bytes` sets
+your own cap; `--skip-space-check` overrides the check deliberately.
+
 ### Uploading
 
 Artefacts land in `<out-dir>/upload/`. Upload them **one per turn**, and use a fresh conversation for the values that decide the boundary. Uploading the whole sweep at once varies per-file size, attachment count, and total turn payload simultaneously, so a failure cannot be attributed to any of them. Batch generation is the labour saving; batch uploading destroys the measurement.

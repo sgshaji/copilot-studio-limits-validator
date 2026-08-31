@@ -176,6 +176,23 @@ python scripts/generate_report.py --ledger pdf.json --ledger docx.json \
   --out report.md
 ```
 
+### Build one pack at a time
+
+The agent sandbox is small -- of the order of a few hundred MB free -- and the
+pack is copied again when it is handed to the user. A single `--around 50MB`
+sweep is already ~260 MiB; four of them for a path comparison will not fit.
+
+Comparing paths means **one sweep per path, generated and uploaded in turn**,
+not the whole matrix up front. Artefacts are uploaded one per turn anyway, so
+building everything in advance buys nothing and risks exhausting the sandbox
+mid-run. Narrow to a three-point bracket (below, at, above) and bisect from
+there when space is tight.
+
+`build_test_pack.py` refuses a pack that will not fit and says how much space
+it needed. `--max-total-bytes` imposes your own cap.
+
+### Uploading
+
 Artefacts are written to `<out-dir>/upload/`. Upload exactly that directory's
 contents, **one file per turn**, and use a fresh conversation for the values
 that decide the boundary. Uploading the sweep together varies per-file size,
@@ -189,7 +206,7 @@ finishing.
 
 ### 4. Announce active testing
 Before tenant interaction, state the number of artefacts/scenarios and total
-bytes. Follow `references/safety-boundaries.md`.
+bytes. Check the figure is one the sandbox can actually hold before building. Follow `references/safety-boundaries.md`.
 
 ### 5. Probe through the tested path only
 Read `probe-sheet.md`, not the manifest. Ask for the tokens only through the
