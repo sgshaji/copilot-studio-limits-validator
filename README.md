@@ -6,6 +6,15 @@ The skill is designed for **quantitative, bounded validation**: file size, page 
 
 > **Harness Explorer discovers what exists. Limits Validator measures how far a specific capability reliably works.**
 
+## Start here
+
+- **Inspect:** [measurement protocol](references/test-protocol.md), [implementation](scripts/), and [unit tests](tests/test_core.py).
+- **Reproduce offline:** [run the tests](#tests); no third-party Python packages are needed.
+- **Measure a live agent:** follow [TESTING.md](TESTING.md), including isolation between the pack generator and the agent receiving the upload.
+
+The engineering goal is a defensible decision about one capability in one environment,
+not a blanket claim about a platform's limits.
+
 ## Why this exists
 
 Three mistakes make platform limits easy to misstate:
@@ -230,7 +239,12 @@ copilot-studio-limits-validator/
 python -m unittest discover -s tests -v
 ```
 
-35 tests, no third-party Python packages. They cover canary independence and digest verification, exact-size generation, structural validity of all five formats, pack isolation, planner convergence, every reconciliation verdict, evidence gating, scope and path-integrity recording, schema conformance, and a build → record → plan → report round trip.
+39 tests, no third-party Python packages. They cover canary independence and digest verification, exact-size generation, structural validity of all five formats, pack isolation, planner convergence, every reconciliation verdict, evidence gating, scope and path-integrity recording, schema conformance, and a build → record → plan → report round trip.
+
+**Verification record:** all 39 tests passed on Windows with Python 3.14.7 on 27 October
+2026. [CI](https://github.com/sgshaji/copilot-studio-limits-validator/actions/workflows/test.yml)
+also defines the suite on Python 3.11. This verifies the tooling, not a live Copilot Studio
+boundary; a platform measurement needs a separate experiment with recorded scope and path integrity.
 
 ## Packaging
 
